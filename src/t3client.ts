@@ -1,38 +1,18 @@
 /**
- * T3 Code WebSocket RPC client.
+ * T3 Code v0.0.40 WebSocket RPC client.
  *
- * T3 Code uses Effect's unstable RPC layer over WebSocket. The wire format is
- * NDJSON where each message is:
- *
- *   Request (client → server):
- *     { "_tag": "Request", "id": "<uuid>", "tag": "<method>", "payload": <object> }
- *
- *   Response (server → client):
- *     { "_tag": "Exit", "id": "<uuid>", "exit": { "_tag": "Success", "value": <object> } }
- *   or
- *     { "_tag": "Exit", "id": "<uuid>", "exit": { "_tag": "Failure", "cause": <object> } }
- *
- *   Stream item:
- *     { "_tag": "Chunk", "id": "<uuid>", "value": <object> }
- *   Stream end:
- *     { "_tag": "End", "id": "<uuid>" }
- *
- * Auth flow:
- *   1. POST /api/auth/bootstrap/bearer with { credential: "<token>" }
- *      → { sessionToken: "...", expiresAt: "..." }
- *   2. POST /api/auth/ws-token with Authorization: Bearer <sessionToken>
- *      → { token: "..." }
- *   3. Connect to ws://<host>/ws?token=<ws-token>
+ * The server uses Effect RPC JSON frames over WebSocket. Client requests use
+ * `id`; server responses use `requestId`. Streaming chunks contain a batch
+ * of `values` and require an Ack before the server emits the next batch.
  */
 
+import { randomUUID } from "node:crypto";
 import WebSocket from "ws";
-import { randomUUID } from "crypto";
+import type { AccessTokenProvider } from "./auth.js";
 
 export interface T3ClientConfig {
-  /** Base URL of the T3 Code server, e.g. http://localhost:3000 */
   baseUrl: string;
-  /** Bootstrap token (the pairing credential from T3 Code settings) */
-  token: string;
+  accessTokenProvider: AccessTokenProvider;
 }
 
 interface RpcRequest {
@@ -40,133 +20,170 @@ interface RpcRequest {
   id: string;
   tag: string;
   payload: unknown;
+  headers: Array<[string, string]>;
+}
+
+interface RpcAck {
+  _tag: "Ack";
+  requestId: string;
+}
+
+interface RpcInterrupt {
+  _tag: "Interrupt";
+  requestId: string;
 }
 
 interface RpcExitSuccess {
   _tag: "Exit";
-  id: string;
+  requestId: string;
   exit: { _tag: "Success"; value: unknown };
 }
 
 interface RpcExitFailure {
   _tag: "Exit";
-  id: string;
+  requestId: string;
   exit: { _tag: "Failure"; cause: unknown };
 }
 
 interface RpcChunk {
   _tag: "Chunk";
-  id: string;
-  value: unknown;
+  requestId: string;
+  values: unknown[];
 }
 
-interface RpcEnd {
-  _tag: "End";
-  id: string;
+interface RpcDefect {
+  _tag: "Defect";
+  defect: unknown;
 }
 
-type RpcMessage = RpcExitSuccess | RpcExitFailure | RpcChunk | RpcEnd;
+interface RpcClientProtocolError {
+  _tag: "ClientProtocolError";
+  error: unknown;
+}
+
+interface RpcPong {
+  _tag: "Pong";
+}
+
+type RpcMessage =
+  | RpcExitSuccess
+  | RpcExitFailure
+  | RpcChunk
+  | RpcDefect
+  | RpcClientProtocolError
+  | RpcPong;
 
 interface PendingRequest {
   resolve: (value: unknown) => void;
   reject: (reason: unknown) => void;
-  /** If set, this is a streaming request; chunks go here */
   onChunk?: (value: unknown) => void;
+}
+
+class T3HttpError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+  ) {
+    super(message);
+  }
 }
 
 export class T3Client {
   private ws: WebSocket | null = null;
   private pending = new Map<string, PendingRequest>();
-  private sessionToken: string | null = null;
   private connectPromise: Promise<void> | null = null;
   private closing = false;
 
   constructor(private readonly config: T3ClientConfig) {}
 
-  /** Normalize base URL: strip trailing slash, ensure http(s) scheme */
   private get httpBase(): string {
-    const url = new URL(this.config.baseUrl.replace(/^ws/, "http"));
-    return url.origin;
+    return new URL(this.config.baseUrl.replace(/^ws/, "http")).origin;
   }
 
   private get wsBase(): string {
-    const url = new URL(this.config.baseUrl.replace(/^http/, "ws").replace(/^https/, "wss"));
-    return url.origin;
+    return new URL(this.config.baseUrl.replace(/^http/, "ws")).origin;
   }
 
-  /** Exchange the bootstrap token for a bearer session token */
-  private async bootstrapSession(): Promise<string> {
-    const res = await fetch(`${this.httpBase}/api/auth/bootstrap/bearer`, {
+  private async getWsTicket(accessToken: string): Promise<string> {
+    const response = await fetch(`${this.httpBase}/api/auth/websocket-ticket`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ credential: this.config.token }),
+      headers: { Authorization: `Bearer ${accessToken}` },
     });
-    if (!res.ok) {
-      const text = await res.text().catch(() => "");
-      throw new Error(`T3 Code auth bootstrap failed (${res.status}): ${text}`);
+
+    if (!response.ok) {
+      const detail = await response.text().catch(() => "");
+      throw new T3HttpError(
+        `T3 Code websocket-ticket failed (${response.status}): ${detail}`,
+        response.status,
+      );
     }
-    const data = (await res.json()) as { sessionToken?: string; token?: string };
-    const token = data.sessionToken ?? data.token;
-    if (!token) {
-      throw new Error(`T3 Code auth bootstrap response missing sessionToken: ${JSON.stringify(data)}`);
+
+    const data = (await response.json()) as { ticket?: unknown };
+    if (typeof data.ticket !== "string" || !data.ticket) {
+      throw new Error("T3 Code websocket-ticket response did not include a ticket");
     }
-    return token;
+
+    return data.ticket;
   }
 
-  /** Exchange a bearer session token for a short-lived WebSocket token */
-  private async getWsToken(bearerToken: string): Promise<string> {
-    const res = await fetch(`${this.httpBase}/api/auth/ws-token`, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${bearerToken}` },
-    });
-    if (!res.ok) {
-      const text = await res.text().catch(() => "");
-      throw new Error(`T3 Code ws-token failed (${res.status}): ${text}`);
+  private async issueWsTicket(): Promise<string> {
+    let accessToken = await this.config.accessTokenProvider.getAccessToken();
+
+    try {
+      return await this.getWsTicket(accessToken);
+    } catch (error) {
+      if (
+        error instanceof T3HttpError &&
+        (error.status === 401 || error.status === 403) &&
+        this.config.accessTokenProvider.invalidate()
+      ) {
+        accessToken = await this.config.accessTokenProvider.getAccessToken();
+        return this.getWsTicket(accessToken);
+      }
+      throw error;
     }
-    const data = (await res.json()) as { token?: string };
-    if (!data.token) {
-      throw new Error(`T3 Code ws-token response missing token: ${JSON.stringify(data)}`);
-    }
-    return data.token;
   }
 
-  /** Connect to T3 Code (idempotent — reuses an existing open connection) */
   async connect(): Promise<void> {
     if (this.ws?.readyState === WebSocket.OPEN) return;
     if (this.connectPromise) return this.connectPromise;
 
     this.connectPromise = (async () => {
       try {
-        // 1. Bootstrap bearer session
-        this.sessionToken = await this.bootstrapSession();
+        const wsTicket = await this.issueWsTicket();
+        const wsUrl =
+          `${this.wsBase}/ws?wsTicket=${encodeURIComponent(wsTicket)}&orchestrationProtocol=1`;
 
-        // 2. Get WS token
-        const wsToken = await this.getWsToken(this.sessionToken);
-
-        // 3. Open WebSocket
-        const wsUrl = `${this.wsBase}/ws?token=${encodeURIComponent(wsToken)}`;
         await new Promise<void>((resolve, reject) => {
           const ws = new WebSocket(wsUrl);
           this.ws = ws;
 
-          ws.once("open", () => resolve());
-          ws.once("error", (err) => reject(err));
+          const failOpen = (error: Error) => {
+            this.ws = null;
+            reject(error);
+          };
+
+          ws.once("open", () => {
+            ws.off("error", failOpen);
+            resolve();
+          });
+          ws.once("error", failOpen);
 
           ws.on("message", (raw) => {
             try {
-              const msg = JSON.parse(raw.toString()) as RpcMessage;
-              this.handleMessage(msg);
-            } catch {
-              // ignore malformed messages
+              this.handleMessage(JSON.parse(raw.toString()) as RpcMessage);
+            } catch (error) {
+              process.stderr.write(
+                `Ignoring malformed T3 RPC message: ${error instanceof Error ? error.message : String(error)}\n`,
+              );
             }
           });
 
           ws.on("close", () => {
+            this.ws = null;
             if (!this.closing) {
-              // Reject all pending requests
-              for (const [, pending] of this.pending) {
-                pending.reject(new Error("WebSocket closed unexpectedly"));
-              }
+              const error = new Error("T3 Code WebSocket closed unexpectedly");
+              for (const [, pending] of this.pending) pending.reject(error);
               this.pending.clear();
             }
           });
@@ -180,129 +197,131 @@ export class T3Client {
   }
 
   private handleMessage(msg: RpcMessage): void {
-    const pending = this.pending.get(msg.id);
+    if (msg._tag === "Pong") return;
+
+    if (msg._tag === "Defect" || msg._tag === "ClientProtocolError") {
+      const detail = msg._tag === "Defect" ? msg.defect : msg.error;
+      const error = new Error(`T3 Code RPC protocol error: ${JSON.stringify(detail)}`);
+      for (const [, pending] of this.pending) pending.reject(error);
+      this.pending.clear();
+      return;
+    }
+
+    const pending = this.pending.get(msg.requestId);
+
+    if (msg._tag === "Chunk") {
+      this.send({ _tag: "Ack", requestId: msg.requestId });
+      if (!pending?.onChunk) return;
+      for (const value of msg.values) pending.onChunk(value);
+      return;
+    }
+
     if (!pending) return;
 
-    if (msg._tag === "Exit") {
-      this.pending.delete(msg.id);
-      if (msg.exit._tag === "Success") {
-        pending.resolve(msg.exit.value);
-      } else {
-        pending.reject(new Error(`T3 Code RPC error: ${JSON.stringify(msg.exit.cause)}`));
-      }
-    } else if (msg._tag === "Chunk" && pending.onChunk) {
-      pending.onChunk(msg.value);
-    } else if (msg._tag === "End") {
-      this.pending.delete(msg.id);
-      pending.resolve(null);
+    this.pending.delete(msg.requestId);
+    if (msg.exit._tag === "Success") {
+      pending.resolve(msg.exit.value);
+    } else {
+      pending.reject(new Error(`T3 Code RPC error: ${JSON.stringify(msg.exit.cause)}`));
     }
   }
 
-  private send(message: RpcRequest): void {
+  private send(message: RpcRequest | RpcAck | RpcInterrupt): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      throw new Error("WebSocket is not connected");
+      throw new Error("T3 Code WebSocket is not connected");
     }
     this.ws.send(JSON.stringify(message));
   }
 
-  /** Send a unary RPC request and await the response */
   async request<T = unknown>(method: string, payload: unknown = {}): Promise<T> {
     await this.connect();
     const id = randomUUID();
+
     return new Promise<T>((resolve, reject) => {
       this.pending.set(id, {
-        resolve: resolve as (v: unknown) => void,
+        resolve: resolve as (value: unknown) => void,
         reject,
       });
+
       try {
-        this.send({ _tag: "Request", id, tag: method, payload });
-      } catch (err) {
+        this.send({ _tag: "Request", id, tag: method, payload, headers: [] });
+      } catch (error) {
         this.pending.delete(id);
-        reject(err);
+        reject(error);
       }
     });
   }
 
-  /** Send a streaming RPC request; calls onChunk for each item, resolves when stream ends */
   async requestStream<T = unknown>(
     method: string,
     payload: unknown,
     onChunk: (value: T) => void,
+    signal?: AbortSignal,
   ): Promise<void> {
     await this.connect();
     const id = randomUUID();
+
     return new Promise<void>((resolve, reject) => {
       this.pending.set(id, {
         resolve: () => resolve(),
         reject,
-        onChunk: onChunk as (v: unknown) => void,
+        onChunk: onChunk as (value: unknown) => void,
       });
-      try {
-        this.send({ _tag: "Request", id, tag: method, payload });
-      } catch (err) {
+
+      const abort = () => {
+        try {
+          this.send({ _tag: "Interrupt", requestId: id });
+        } catch {
+          // The WebSocket may already be gone; local cleanup still matters.
+        }
         this.pending.delete(id);
-        reject(err);
+        resolve();
+      };
+
+      if (signal?.aborted) {
+        abort();
+        return;
+      }
+      signal?.addEventListener("abort", abort, { once: true });
+
+      try {
+        this.send({ _tag: "Request", id, tag: method, payload, headers: [] });
+      } catch (error) {
+        signal?.removeEventListener("abort", abort);
+        this.pending.delete(id);
+        reject(error);
       }
     });
   }
 
-  /** Close the WebSocket connection */
   close(): void {
     this.closing = true;
     this.ws?.close();
     this.ws = null;
+
+    const error = new Error("T3 Code client closed");
+    for (const [, pending] of this.pending) pending.reject(error);
+    this.pending.clear();
   }
 
-  // ─── High-level API methods ───────────────────────────────────────────────
-
-  /** Get server config (providers, keybindings, settings) */
   async getConfig(): Promise<unknown> {
     return this.request("server.getConfig", {});
   }
 
-  /**
-   * Dispatch an orchestration command (thread.turn.start, thread.turn.interrupt,
-   * thread.session.stop, etc.)
-   */
   async dispatchCommand(command: unknown): Promise<{ sequence: number }> {
     return this.request<{ sequence: number }>("orchestration.dispatchCommand", command);
   }
 
-  /**
-   * Subscribe to a thread's event stream. Returns collected events (up to
-   * `timeoutMs` milliseconds). For persistent subscriptions use requestStream
-   * directly.
-   */
   async subscribeThread(
     threadId: string,
     onItem: (item: unknown) => void,
     signal?: AbortSignal,
   ): Promise<void> {
-    const id = randomUUID();
-    await this.connect();
-    return new Promise<void>((resolve, reject) => {
-      this.pending.set(id, {
-        resolve: () => resolve(),
-        reject,
-        onChunk: onItem,
-      });
-
-      signal?.addEventListener("abort", () => {
-        this.pending.delete(id);
-        resolve();
-      });
-
-      try {
-        this.send({
-          _tag: "Request",
-          id,
-          tag: "orchestration.subscribeThread",
-          payload: { threadId },
-        });
-      } catch (err) {
-        this.pending.delete(id);
-        reject(err);
-      }
-    });
+    return this.requestStream(
+      "orchestration.subscribeThread",
+      { threadId },
+      onItem,
+      signal,
+    );
   }
 }
