@@ -1,80 +1,87 @@
 #!/usr/bin/env node
-/**
- * t3code-mcp — MCP server for T3 Code
- *
- * Exposes T3 Code's WebSocket RPC API as MCP tools so any MCP-compatible
- * client (Claude Desktop, opencode, etc.) can delegate coding tasks to a
- * running T3 Code instance.
- *
- * Environment variables:
- *   T3_CODE_URL    Base URL of the T3 Code server (default: http://localhost:3000)
- *   T3_CODE_TOKEN  Bootstrap / pairing credential token (required)
- */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { accessTokenProviderFromEnvironment } from "./auth.js";
+import { serveStreamableHttp } from "./http.js";
 import { T3Client } from "./t3client.js";
 import { registerTools } from "./tools.js";
 
-const baseUrl = process.env.T3_CODE_URL ?? "http://localhost:3000";
-const token = process.env.T3_CODE_TOKEN;
+const baseUrl = process.env.T3_CODE_URL ?? "http://127.0.0.1:3000";
+const accessTokenProvider = await accessTokenProviderFromEnvironment(baseUrl);
+const client = new T3Client({ baseUrl, accessTokenProvider });
 
-if (!token) {
+function createMcpServer(): McpServer {
+  const server = new McpServer(
+    {
+      name: "t3code-mcp",
+      version: "0.1.0",
+      description: "MCP server for orchestrating T3 Code",
+    },
+    {
+      instructions: [
+        "# T3 Code MCP",
+        "",
+        "Use T3 Code as a coding-agent orchestrator.",
+        "1. Call t3_get_config to discover provider instance IDs and models.",
+        "2. Call t3_send_prompt with an instanceId, model, and project/workspace.",
+        "3. Poll with t3_get_status when more output is needed.",
+        "4. Use t3_interrupt or t3_stop_session for lifecycle control.",
+      ].join("\n"),
+    },
+  );
+
+  registerTools(server, client);
+  return server;
+}
+
+try {
+  await client.connect();
+} catch (error) {
   process.stderr.write(
-    "ERROR: T3_CODE_TOKEN environment variable is required.\n" +
-      "Set it to your T3 Code pairing/bootstrap credential token.\n",
+    `ERROR: could not connect to T3 Code: ${error instanceof Error ? error.message : String(error)}\n`,
   );
   process.exit(1);
 }
 
-const client = new T3Client({ baseUrl, token });
+const transportMode = (process.env.MCP_TRANSPORT ?? "stdio").toLowerCase();
+let closeMcp: () => Promise<void>;
 
-const server = new McpServer(
-  {
-    name: "t3code-mcp",
-    version: "0.1.0",
-    description:
-      "MCP server for T3 Code — delegates coding tasks to a running T3 Code instance " +
-      "via its WebSocket RPC API.",
-  },
-  {
-    instructions: [
-      "# T3 Code MCP — Guide for LLM clients",
-      "",
-      "You are connected to T3 Code, an AI-powered coding environment.",
-      "Use these tools to send coding tasks, monitor progress, and control sessions.",
-      "",
-      "## Typical workflow",
-      "1. Call `t3_get_config` once to see available providers and models.",
-      "2. Call `t3_send_prompt` with your coding task. This creates a thread and",
-      "   starts a turn. It will wait up to 30 s collecting response events.",
-      "3. If the task is still running, call `t3_get_status` with the threadId",
-      "   to collect more events.",
-      "4. Use `t3_interrupt` to cancel a running turn, or `t3_stop_session` to",
-      "   fully terminate the provider session.",
-      "",
-      "## Tool summary",
-      "- `t3_send_prompt`  — Start a new coding task",
-      "- `t3_get_status`   — Poll for progress on an existing thread",
-      "- `t3_interrupt`    — Interrupt the running turn",
-      "- `t3_stop_session` — Stop the provider session",
-      "- `t3_get_config`   — Get server config (providers, models)",
-    ].join("\n"),
-  },
-);
+if (transportMode === "http") {
+  const port = Number.parseInt(process.env.MCP_HTTP_PORT ?? "8732", 10);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error(`Invalid MCP_HTTP_PORT: ${process.env.MCP_HTTP_PORT}`);
+  }
 
-registerTools(server, client);
+  closeMcp = await serveStreamableHttp(createMcpServer, {
+    host: process.env.MCP_HTTP_HOST ?? "127.0.0.1",
+    port,
+    path: process.env.MCP_HTTP_PATH ?? "/mcp",
+  });
+} else if (transportMode === "stdio") {
+  const server = createMcpServer();
+  await server.connect(new StdioServerTransport());
+  closeMcp = () => server.close();
+} else {
+  throw new Error(`Unsupported MCP_TRANSPORT: ${transportMode}`);
+}
 
-const transport = new StdioServerTransport();
+let shuttingDown = false;
+const shutdown = async (exitCode: number) => {
+  if (shuttingDown) return;
+  shuttingDown = true;
 
-// Graceful shutdown
-process.on("SIGINT", () => {
-  client.close();
-  process.exit(0);
-});
-process.on("SIGTERM", () => {
-  client.close();
-  process.exit(0);
-});
+  try {
+    await closeMcp();
+  } catch (error) {
+    process.stderr.write(
+      `ERROR: failed to close MCP transport: ${error instanceof Error ? error.message : String(error)}\n`,
+    );
+  } finally {
+    client.close();
+    process.exit(exitCode);
+  }
+};
 
-await server.connect(transport);
+process.on("SIGINT", () => void shutdown(0));
+process.on("SIGTERM", () => void shutdown(0));

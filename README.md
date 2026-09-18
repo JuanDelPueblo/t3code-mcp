@@ -1,148 +1,123 @@
 # t3code-mcp
 
-An [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server that wraps [T3 Code](https://github.com/pingdotgg/t3code)'s WebSocket RPC API, letting any MCP-compatible client (Claude Desktop, opencode, etc.) delegate coding tasks to a running T3 Code instance.
+MCP server for orchestrating [T3 Code](https://github.com/pingdotgg/t3code).
 
-## Prerequisites
+This fork targets the current T3 Code authentication and orchestration protocol used by
+T3 v0.0.40 and supports both local stdio clients and a long-running Streamable HTTP service.
 
-- A running T3 Code instance (desktop app or server)
-- A bootstrap/pairing credential token from T3 Code
+## MCP tools
 
-## Installation
+- `t3_get_config` — inspect configured provider instances and model catalogs
+- `t3_send_prompt` — create a project/thread and start a coding turn
+- `t3_get_status` — collect recent thread events
+- `t3_interrupt` — interrupt a running turn
+- `t3_stop_session` — stop a provider session
 
-### From source
+`t3_send_prompt` uses T3's native `instanceId + model` model selection. Call
+`t3_get_config` first instead of assuming a provider or model name.
+
+## Authentication
+
+The server accepts three authentication modes, in this order:
+
+1. `T3_CODE_ACCESS_TOKEN` or `T3_CODE_ACCESS_TOKEN_FILE` — an existing bearer access token.
+2. `T3_CODE_TOKEN` or `T3_CODE_TOKEN_FILE` — a one-time pairing/bootstrap credential.
+3. `T3_CODE_BASE_DIR` — local mode. The server runs the T3 CLI to mint a short-lived,
+   one-time pairing credential and exchanges it for a normal bearer session.
+
+Local mode is intended for a system service running on the same machine as T3. It does not
+store a long-lived MCP credential. If the bearer session expires, the server can mint a fresh
+pairing credential automatically.
+
+Optional local-mode variables:
+
+- `T3_CODE_CLI` — T3 CLI executable, default `t3`
+- `T3_CODE_PAIRING_TTL` — pairing credential TTL, default `5m`
+- `T3_CODE_PAIRING_LABEL` — label shown in T3 auth state, default `t3code-mcp`
+
+The T3 server URL is configured with `T3_CODE_URL` and defaults to
+`http://127.0.0.1:3000`.
+
+## Transports
+
+### stdio
+
+stdio remains the default for clients that spawn the MCP server themselves:
 
 ```bash
-git clone https://github.com/JulianBeaulieu/t3code-mcp.git
-cd t3code-mcp
-npm install
-npm run build
+T3_CODE_URL=http://127.0.0.1:3000 \
+T3_CODE_TOKEN='pairing-credential' \
+t3code-mcp
 ```
 
-### Via npx (once published to npm)
+### Streamable HTTP
+
+For a persistent local service:
 
 ```bash
-npx t3code-mcp
+MCP_TRANSPORT=http \
+MCP_HTTP_HOST=127.0.0.1 \
+MCP_HTTP_PORT=8732 \
+MCP_HTTP_PATH=/mcp \
+T3_CODE_URL=http://127.0.0.1:8731 \
+T3_CODE_BASE_DIR=/var/lib/t3code \
+T3_CODE_CLI=/path/to/t3 \
+t3code-mcp
 ```
 
-## Configuration
+The endpoint is then `http://127.0.0.1:8732/mcp`.
 
-| Environment variable | Required | Default                  | Description                                                   |
-|----------------------|----------|--------------------------|---------------------------------------------------------------|
-| `T3_CODE_TOKEN`      | **Yes**  | —                        | Your T3 Code bootstrap/pairing credential token               |
-| `T3_CODE_URL`        | No       | `http://localhost:3000`  | Base URL of your T3 Code server                               |
+## Nix
 
-### Getting your token
+The repository carries a native package and NixOS module:
 
-1. Open T3 Code
-2. Go to **Settings → API / Pairing**
-3. Generate a pairing token — this is your `T3_CODE_TOKEN`
+- `nix/package.nix`
+- `nix/module.nix`
 
-## MCP client setup
+Example NixOS usage when the repository is available as a source path:
 
-### Claude Desktop (`claude_desktop_config.json`)
-
-```json
+```nix
 {
-  "mcpServers": {
-    "t3code": {
-      "command": "node",
-      "args": ["/path/to/t3code-mcp/dist/index.js"],
-      "env": {
-        "T3_CODE_URL": "http://localhost:3000",
-        "T3_CODE_TOKEN": "your-pairing-token-here"
-      }
-    }
-  }
+  imports = [ /path/to/t3code-mcp/nix/module.nix ];
+
+  services.t3code-mcp = {
+    enable = true;
+    user = "t3";
+    group = "t3";
+    createUser = false;
+
+    listenAddress = "127.0.0.1";
+    port = 8732;
+
+    t3Url = "http://127.0.0.1:8731";
+    t3BaseDir = "/var/lib/t3code";
+    t3Command = "/path/to/t3";
+    after = [ "t3code.service" ];
+    requires = [ "t3code.service" ];
+  };
 }
 ```
 
-### opencode (`~/.config/opencode/config.json`)
-
-```json
-{
-  "mcp": {
-    "t3code": {
-      "type": "local",
-      "command": ["node", "/path/to/t3code-mcp/dist/index.js"],
-      "environment": {
-        "T3_CODE_URL": "http://localhost:3000",
-        "T3_CODE_TOKEN": "your-pairing-token-here"
-      }
-    }
-  }
-}
-```
-
-### Running directly for development
-
-```bash
-T3_CODE_URL=http://localhost:3000 T3_CODE_TOKEN=your-token npm run dev
-```
-
-## Available tools
-
-| Tool              | Description                                                                           |
-|-------------------|---------------------------------------------------------------------------------------|
-| `t3_send_prompt`  | Send a coding task to T3 Code. Creates a thread, starts a turn, and collects events. |
-| `t3_get_status`   | Poll an existing thread for recent events / progress.                                 |
-| `t3_interrupt`    | Interrupt the currently running turn in a thread.                                     |
-| `t3_stop_session` | Fully stop the provider session for a thread.                                         |
-| `t3_get_config`   | Retrieve server configuration (available providers, models, settings).                |
-
-## Typical workflow
-
-```
-1. t3_get_config          → discover available providers and models
-2. t3_send_prompt         → start a coding task (returns threadId + initial response)
-3. t3_get_status          → poll for more output (repeat as needed)
-4. t3_interrupt           → cancel if needed
-5. t3_stop_session        → clean up the session when done
-```
-
-## Architecture
-
-```
-MCP Client (Claude / opencode)
-        │  stdio (JSON-RPC 2.0)
-        ▼
-  t3code-mcp (this server)
-        │  WebSocket RPC (Effect unstable/rpc NDJSON protocol)
-        ▼
-  T3 Code server  ws://localhost:3000/ws
-```
-
-### Auth flow
-
-1. POST `/api/auth/bootstrap/bearer` with `{ credential: T3_CODE_TOKEN }` → bearer session token
-2. POST `/api/auth/ws-token` with `Authorization: Bearer <session-token>` → short-lived WS token
-3. Open WebSocket at `ws://host/ws?token=<ws-token>`
-
-### Wire protocol
-
-T3 Code uses [Effect](https://effect.website)'s `unstable/rpc` over WebSocket with NDJSON framing:
-
-```jsonc
-// Request (client → server)
-{ "_tag": "Request", "id": "<uuid>", "tag": "<method>", "payload": {} }
-
-// Unary response
-{ "_tag": "Exit", "id": "<uuid>", "exit": { "_tag": "Success", "value": {} } }
-
-// Streaming chunk
-{ "_tag": "Chunk", "id": "<uuid>", "value": {} }
-
-// Stream end
-{ "_tag": "End", "id": "<uuid>" }
-```
+The service uses Streamable HTTP and is hardened with systemd. Only the MCP service needs
+write access to the T3 base directory for local pairing; MCP clients do not.
 
 ## Development
 
 ```bash
-npm install
-npm run typecheck   # type-check without emitting
-npm run build       # compile to dist/
-npm run dev         # run from source with tsx
+npm ci
+npm run typecheck
+npm run build
 ```
+
+## Protocol notes
+
+T3 v0.0.40 uses:
+
+- OAuth token exchange at `/oauth/token`
+- WebSocket tickets at `/api/auth/websocket-ticket`
+- `/ws?wsTicket=...&orchestrationProtocol=1`
+- Effect RPC JSON messages with `requestId` on responses
+- batched stream `Chunk.values` with client acknowledgements
 
 ## License
 
