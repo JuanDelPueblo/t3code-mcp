@@ -1,9 +1,14 @@
 /**
- * T3 Code v0.0.40 WebSocket RPC client.
+ * T3 Code v0.0.42 orchestration client.
  *
  * The server uses Effect RPC JSON frames over WebSocket. Client requests use
  * `id`; server responses use `requestId`. Streaming chunks contain a batch
  * of `values` and require an Ack before the server emits the next batch.
+ *
+ * Thread discovery and current-state snapshots use T3's supported HTTP
+ * orchestration API instead of private state: `/api/orchestration/snapshot`
+ * returns the full read model and `/api/orchestration/threads/:threadId`
+ * returns one thread's detail snapshot.
  */
 
 import { randomUUID } from "node:crypto";
@@ -13,6 +18,78 @@ import type { AccessTokenProvider } from "./auth.js";
 export interface T3ClientConfig {
   baseUrl: string;
   accessTokenProvider: AccessTokenProvider;
+}
+
+export interface T3LatestTurn {
+  turnId: string;
+  state: string;
+  requestedAt: string;
+  startedAt: string | null;
+  completedAt: string | null;
+  assistantMessageId: string | null;
+}
+
+export interface T3Activity {
+  id: string;
+  tone: string;
+  kind: string;
+  summary: string;
+  payload: unknown;
+  turnId: string | null;
+  createdAt: string;
+}
+
+export interface T3Message {
+  id: string;
+  role: string;
+  text: string;
+  createdAt: string;
+}
+
+export interface T3Thread {
+  id: string;
+  projectId: string;
+  title: string;
+  runtimeMode: string;
+  interactionMode: string;
+  branch: string | null;
+  worktreePath: string | null;
+  latestTurn: T3LatestTurn | null;
+  createdAt: string;
+  updatedAt: string;
+  archivedAt: string | null | undefined;
+  settledOverride: "settled" | "active" | null;
+  settledAt: string | null;
+  deletedAt: string | null;
+  messages: T3Message[];
+  activities: T3Activity[];
+  session: {
+    status: string;
+    providerName: string | null;
+    activeTurnId: string | null;
+    lastError: string | null;
+    updatedAt: string;
+  } | null;
+}
+
+export interface T3Project {
+  id: string;
+  title: string;
+  workspaceRoot: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface T3ReadModel {
+  snapshotSequence: number;
+  projects: T3Project[];
+  threads: T3Thread[];
+  updatedAt: string;
+}
+
+export interface T3ThreadDetailSnapshot {
+  snapshotSequence: number;
+  thread: T3Thread;
 }
 
 interface RpcRequest {
@@ -126,6 +203,75 @@ export class T3Client {
     return data.ticket;
   }
 
+  private async httpGetJson(
+    accessToken: string,
+    path: string,
+    params?: URLSearchParams,
+  ): Promise<unknown> {
+    const url = new URL(path, `${this.httpBase}/`);
+    if (params) {
+      for (const [key, value] of params) url.searchParams.set(key, value);
+    }
+
+    const response = await fetch(url, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+
+    if (!response.ok) {
+      const detail = await response.text().catch(() => "");
+      throw new T3HttpError(
+        `T3 Code ${path} failed (${response.status}): ${detail}`,
+        response.status,
+      );
+    }
+
+    return response.json();
+  }
+
+  private async authedGet(path: string, params?: URLSearchParams): Promise<unknown> {
+    let accessToken = await this.config.accessTokenProvider.getAccessToken();
+
+    try {
+      return await this.httpGetJson(accessToken, path, params);
+    } catch (error) {
+      if (
+        error instanceof T3HttpError &&
+        (error.status === 401 || error.status === 403) &&
+        this.config.accessTokenProvider.invalidate()
+      ) {
+        accessToken = await this.config.accessTokenProvider.getAccessToken();
+        return this.httpGetJson(accessToken, path, params);
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Fetch T3's full orchestration read model over the supported HTTP API.
+   * Includes every project and thread with its current state, so callers can
+   * discover threads created by any client without touching private state.
+   */
+  async getReadModel(): Promise<T3ReadModel> {
+    return (await this.authedGet("/api/orchestration/snapshot")) as T3ReadModel;
+  }
+
+  /**
+   * Fetch one thread's current detail snapshot over the supported HTTP API.
+   * Returns immediately with the present state; no event waiting is involved.
+   */
+  async getThreadSnapshot(
+    threadId: string,
+    turnLimit?: number,
+  ): Promise<T3ThreadDetailSnapshot> {
+    const params = new URLSearchParams();
+    if (turnLimit !== undefined) params.set("turnLimit", String(turnLimit));
+    const snapshot = await this.authedGet(
+      `/api/orchestration/threads/${encodeURIComponent(threadId)}`,
+      params,
+    );
+    return snapshot as T3ThreadDetailSnapshot;
+  }
+
   private async issueWsTicket(): Promise<string> {
     let accessToken = await this.config.accessTokenProvider.getAccessToken();
 
@@ -144,15 +290,13 @@ export class T3Client {
     }
   }
 
-  async connect(): Promise<void> {
-    if (this.ws?.readyState === WebSocket.OPEN) return;
+  async connect(): Promise<void> {    if (this.ws?.readyState === WebSocket.OPEN) return;
     if (this.connectPromise) return this.connectPromise;
 
     this.connectPromise = (async () => {
       try {
         const wsTicket = await this.issueWsTicket();
-        const wsUrl =
-          `${this.wsBase}/ws?wsTicket=${encodeURIComponent(wsTicket)}&orchestrationProtocol=1`;
+        const wsUrl = `${this.wsBase}/ws?wsTicket=${encodeURIComponent(wsTicket)}`;
 
         await new Promise<void>((resolve, reject) => {
           const ws = new WebSocket(wsUrl);
@@ -312,14 +456,20 @@ export class T3Client {
     return this.request<{ sequence: number }>("orchestration.dispatchCommand", command);
   }
 
+  /**
+   * Stream one thread's snapshot plus live events. Without `afterSequence`
+   * the server emits `{kind: "snapshot"}` first, then catch-up and live
+   * events, and marks the catch-up boundary with `{kind: "synchronized"}`.
+   */
   async subscribeThread(
     threadId: string,
     onItem: (item: unknown) => void,
     signal?: AbortSignal,
+    afterSequence?: number,
   ): Promise<void> {
     return this.requestStream(
       "orchestration.subscribeThread",
-      { threadId },
+      afterSequence === undefined ? { threadId } : { threadId, afterSequence },
       onItem,
       signal,
     );

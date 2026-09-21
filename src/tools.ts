@@ -1,11 +1,11 @@
 /**
- * MCP tool implementations for T3 Code v0.0.40.
+ * MCP tool implementations for T3 Code v0.0.42.
  */
 
 import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { T3Client } from "./t3client.js";
+import { T3Client, type T3ReadModel, type T3ThreadDetailSnapshot } from "./t3client.js";
 
 function now(): string {
   return new Date().toISOString();
@@ -15,17 +15,24 @@ function commandId(): string {
   return randomUUID();
 }
 
-const terminalEventTypes = new Set([
+/** Terminal event types in T3 v0.0.42's orchestration vocabulary. */
+export const terminalEventTypes: ReadonlySet<string> = new Set([
+  "thread.settled",
   "thread.turn-diff-completed",
   "thread.session-stop-requested",
-  "thread.turn-completed",
-  "thread.turn-failed",
 ]);
+
+const MAX_TEXT_CHARS = 1000;
+
+function truncate(text: string, maxChars = MAX_TEXT_CHARS): string {
+  return text.length > maxChars ? `${text.slice(0, maxChars)}…` : text;
+}
 
 async function collectThreadEvents(
   client: T3Client,
   threadId: string,
   timeoutMs: number,
+  afterSequence?: number,
 ): Promise<unknown[]> {
   const events: unknown[] = [];
   const controller = new AbortController();
@@ -47,12 +54,108 @@ async function collectThreadEvents(
         }
       },
       controller.signal,
+      afterSequence,
     );
   } finally {
     clearTimeout(timer);
   }
 
   return events;
+}
+
+/** Format a read model into discovery rows for t3_list_threads. */
+export function formatThreadRows(
+  readModel: T3ReadModel,
+  options: { query?: string; limit?: number } = {},
+): string {
+  const limit = options.limit ?? 20;
+  const query = options.query?.trim().toLowerCase();
+  const projectTitles = new Map(
+    readModel.projects.map((project) => [project.id, project]),
+  );
+
+  const threads = readModel.threads
+    .filter((thread) => thread.deletedAt === null)
+    .filter((thread) => thread.archivedAt === undefined || thread.archivedAt === null)
+    .filter((thread) => {
+      if (!query) return true;
+      return (
+        thread.title.toLowerCase().includes(query) ||
+        thread.id.toLowerCase().includes(query)
+      );
+    })
+    .sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : -1))
+    .slice(0, limit);
+
+  if (threads.length === 0) {
+    return query ? "(no threads match the query)" : "(no threads exist)";
+  }
+
+  return threads
+    .map((thread) => {
+      const turnState = thread.latestTurn?.state ?? "no-turns";
+      const settled = thread.settledAt !== null || thread.settledOverride === "settled";
+      const sessionStatus = thread.session?.status ?? "no-session";
+      const project = projectTitles.get(thread.projectId);
+      const projectLabel = project ? `${project.title} (${project.workspaceRoot})` : thread.projectId;
+      return [
+        `${thread.title} — turn=${turnState} session=${sessionStatus}${settled ? " settled" : ""}`,
+        `  id: ${thread.id}`,
+        `  project: ${projectLabel}`,
+        `  updated: ${thread.updatedAt}`,
+      ].join("\n");
+    })
+    .join("\n");
+}
+
+/** Format an HTTP thread detail snapshot for t3_get_thread / t3_get_status. */
+export function formatThreadDetail(
+  snapshot: T3ThreadDetailSnapshot,
+  messageLimit = 10,
+  activityLimit = 10,
+): string {
+  const thread = snapshot.thread;
+  const turn = thread.latestTurn;
+  const turnState = turn?.state ?? "no-turns";
+  const settled = thread.settledAt !== null || thread.settledOverride === "settled";
+  const sessionStatus = thread.session?.status ?? "no-session";
+
+  const parts: string[] = [
+    `Thread: ${thread.title}`,
+    `id: ${thread.id}`,
+    `State: turn=${turnState} session=${sessionStatus}${settled ? " settled" : ""} (snapshot sequence ${snapshot.snapshotSequence})`,
+  ];
+
+  if (turn) {
+    parts.push(
+      `Latest turn: state=${turn.state} started=${turn.startedAt ?? "n/a"} completed=${turn.completedAt ?? "n/a"}`,
+    );
+  }
+  if (thread.session?.lastError) {
+    parts.push(`Session error: ${truncate(thread.session.lastError)}`);
+  }
+
+  const messages = thread.messages ?? [];
+  if (messages.length > 0) {
+    parts.push(`Last messages (${Math.min(messageLimit, messages.length)} of ${messages.length}):`);
+    for (const message of messages.slice(-messageLimit)) {
+      parts.push(`  [${message.role ?? "unknown"}] ${truncate(String(message.text ?? ""))}`);
+    }
+  } else {
+    parts.push("Last messages: (none)");
+  }
+
+  const activities = thread.activities ?? [];
+  if (activities.length > 0) {
+    parts.push(`Recent activities (${Math.min(activityLimit, activities.length)} of ${activities.length}):`);
+    for (const activity of activities.slice(-activityLimit)) {
+      parts.push(`  [${activity.kind}] ${truncate(activity.summary ?? "", 300)}`);
+    }
+  } else {
+    parts.push("Recent activities: (none)");
+  }
+
+  return parts.join("\n");
 }
 
 function formatThreadEvents(events: unknown[]): string {
@@ -63,6 +166,11 @@ function formatThreadEvents(events: unknown[]): string {
   for (const item of events) {
     if (!item || typeof item !== "object") continue;
     const record = item as Record<string, unknown>;
+
+    if (record.kind === "synchronized") {
+      parts.push("[synchronized] caught up to live events");
+      continue;
+    }
 
     if (record.kind === "snapshot") {
       const snapshot = record.snapshot as Record<string, unknown> | null;
@@ -75,7 +183,7 @@ function formatThreadEvents(events: unknown[]): string {
         for (const itemMessage of messages) {
           const message = itemMessage as Record<string, unknown>;
           parts.push(
-            `  [${message.role ?? "unknown"}] ${String(message.text ?? "").slice(0, 1000)}`,
+            `  [${message.role ?? "unknown"}] ${truncate(String(message.text ?? ""))}`,
           );
         }
       }
@@ -90,7 +198,7 @@ function formatThreadEvents(events: unknown[]): string {
     if (event.type === "thread.message-sent") {
       const payload = event.payload as Record<string, unknown> | undefined;
       parts.push(
-        `[message] role=${payload?.role ?? "unknown"} text=${String(payload?.text ?? "").slice(0, 1000)}`,
+        `[message] role=${payload?.role ?? "unknown"} text=${truncate(String(payload?.text ?? ""))}`,
       );
     } else {
       parts.push(`[event] ${String(event.type)}`);
@@ -100,7 +208,87 @@ function formatThreadEvents(events: unknown[]): string {
   return parts.join("\n") || "(events captured but no readable content)";
 }
 
+function errorResult(error: unknown) {
+  return {
+    isError: true,
+    content: [
+      {
+        type: "text" as const,
+        text: `Error: ${error instanceof Error ? error.message : String(error)}`,
+      },
+    ],
+  };
+}
+
+function textResult(text: string) {
+  return {
+    content: [{ type: "text" as const, text }],
+  };
+}
+
 export function registerTools(server: McpServer, client: T3Client): void {
+  server.tool(
+    "t3_list_threads",
+    "List existing T3 Code threads with their current state, including threads " +
+      "started from the T3 UI or any other client. Use t3_get_thread to inspect one.",
+    {
+      query: z
+        .string()
+        .min(1)
+        .optional()
+        .describe("Case-insensitive substring filter on thread title or ID"),
+      limit: z
+        .number()
+        .int()
+        .min(1)
+        .max(50)
+        .optional()
+        .describe("Maximum number of threads to return. Default 20."),
+    },
+    async ({ query, limit }) => {
+      try {
+        const readModel = await client.getReadModel();
+        return textResult(formatThreadRows(readModel, { query, limit }));
+      } catch (error) {
+        return errorResult(error);
+      }
+    },
+  );
+
+  server.tool(
+    "t3_get_thread",
+    "Get the current snapshot of an existing T3 Code thread: state, latest turn, " +
+      "recent messages and activities. Works for threads started from any client " +
+      "and returns immediately without waiting for new events.",
+    {
+      threadId: z.string().min(1).describe("T3 Code thread ID (from t3_list_threads or t3_send_prompt)"),
+      messageLimit: z
+        .number()
+        .int()
+        .min(0)
+        .max(50)
+        .optional()
+        .describe("How many recent messages to include. Default 10."),
+      activityLimit: z
+        .number()
+        .int()
+        .min(0)
+        .max(50)
+        .optional()
+        .describe("How many recent activities to include. Default 10."),
+    },
+    async ({ threadId, messageLimit, activityLimit }) => {
+      try {
+        const snapshot = await client.getThreadSnapshot(threadId);
+        return textResult(
+          formatThreadDetail(snapshot, messageLimit ?? 10, activityLimit ?? 10),
+        );
+      } catch (error) {
+        return errorResult(error);
+      }
+    },
+  );
+
   server.tool(
     "t3_send_prompt",
     "Create a T3 Code thread and send it a coding task. Call t3_get_config first " +
@@ -206,68 +394,62 @@ export function registerTools(server: McpServer, client: T3Client): void {
 
         const events = await collectThreadEvents(client, threadId, waitMs ?? 30_000);
 
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: [
-                `Thread created: ${threadId}`,
-                `Project: ${resolvedProjectId}`,
-                "",
-                "Response events:",
-                formatThreadEvents(events),
-              ].join("\n"),
-            },
-          ],
-        };
+        return textResult(
+          [
+            `Thread created: ${threadId}`,
+            `Project: ${resolvedProjectId}`,
+            "",
+            "Response events:",
+            formatThreadEvents(events),
+          ].join("\n"),
+        );
       } catch (error) {
-        return {
-          isError: true,
-          content: [
-            {
-              type: "text" as const,
-              text: `Error: ${error instanceof Error ? error.message : String(error)}`,
-            },
-          ],
-        };
+        return errorResult(error);
       }
     },
   );
 
   server.tool(
     "t3_get_status",
-    "Collect recent events from an existing T3 Code thread.",
+    "Get the current state of a T3 Code thread: an immediate snapshot plus, " +
+      "optionally, live events collected for waitMs milliseconds.",
     {
-      threadId: z.string().min(1).describe("Thread ID returned by t3_send_prompt"),
+      threadId: z.string().min(1).describe("Thread ID returned by t3_send_prompt or t3_list_threads"),
       waitMs: z
         .number()
         .int()
         .min(0)
         .max(120_000)
         .optional()
-        .describe("Milliseconds to collect events. Default 5000."),
+        .describe(
+          "Milliseconds to additionally collect live events after the snapshot. Default 0.",
+        ),
     },
     async ({ threadId, waitMs }) => {
       try {
-        const events = await collectThreadEvents(client, threadId, waitMs ?? 5_000);
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Thread ${threadId} events:\n${formatThreadEvents(events)}`,
-            },
-          ],
-        };
+        const snapshot = await client.getThreadSnapshot(threadId);
+        const tailMs = waitMs ?? 0;
+
+        if (tailMs === 0) {
+          return textResult(formatThreadDetail(snapshot));
+        }
+
+        const events = await collectThreadEvents(
+          client,
+          threadId,
+          tailMs,
+          snapshot.snapshotSequence,
+        );
+        return textResult(
+          [
+            formatThreadDetail(snapshot),
+            "",
+            `Live events (${tailMs}ms):`,
+            formatThreadEvents(events),
+          ].join("\n"),
+        );
       } catch (error) {
-        return {
-          isError: true,
-          content: [
-            {
-              type: "text" as const,
-              text: `Error: ${error instanceof Error ? error.message : String(error)}`,
-            },
-          ],
-        };
+        return errorResult(error);
       }
     },
   );
@@ -288,24 +470,9 @@ export function registerTools(server: McpServer, client: T3Client): void {
           ...(turnId ? { turnId } : {}),
           createdAt: now(),
         });
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Interrupt dispatched. Sequence: ${result.sequence}`,
-            },
-          ],
-        };
+        return textResult(`Interrupt dispatched. Sequence: ${result.sequence}`);
       } catch (error) {
-        return {
-          isError: true,
-          content: [
-            {
-              type: "text" as const,
-              text: `Error: ${error instanceof Error ? error.message : String(error)}`,
-            },
-          ],
-        };
+        return errorResult(error);
       }
     },
   );
@@ -324,24 +491,9 @@ export function registerTools(server: McpServer, client: T3Client): void {
           threadId,
           createdAt: now(),
         });
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Session stop dispatched. Sequence: ${result.sequence}`,
-            },
-          ],
-        };
+        return textResult(`Session stop dispatched. Sequence: ${result.sequence}`);
       } catch (error) {
-        return {
-          isError: true,
-          content: [
-            {
-              type: "text" as const,
-              text: `Error: ${error instanceof Error ? error.message : String(error)}`,
-            },
-          ],
-        };
+        return errorResult(error);
       }
     },
   );
@@ -352,24 +504,9 @@ export function registerTools(server: McpServer, client: T3Client): void {
     {},
     async () => {
       try {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: JSON.stringify(await client.getConfig(), null, 2),
-            },
-          ],
-        };
+        return textResult(JSON.stringify(await client.getConfig(), null, 2));
       } catch (error) {
-        return {
-          isError: true,
-          content: [
-            {
-              type: "text" as const,
-              text: `Error: ${error instanceof Error ? error.message : String(error)}`,
-            },
-          ],
-        };
+        return errorResult(error);
       }
     },
   );
