@@ -98,10 +98,15 @@ export function formatThreadRows(
       const sessionStatus = thread.session?.status ?? "no-session";
       const project = projectTitles.get(thread.projectId);
       const projectLabel = project ? `${project.title} (${project.workspaceRoot})` : thread.projectId;
+      const placement = [
+        ...(thread.branch ? [`branch=${thread.branch}`] : []),
+        ...(thread.worktreePath ? [`worktree=${thread.worktreePath}`] : []),
+      ].join(" ");
       return [
         `${thread.title} — turn=${turnState} session=${sessionStatus}${settled ? " settled" : ""}`,
         `  id: ${thread.id}`,
         `  project: ${projectLabel}`,
+        ...(placement ? [`  ${placement}`] : []),
         `  updated: ${thread.updatedAt}`,
       ].join("\n");
     })
@@ -130,6 +135,12 @@ export function formatThreadDetail(
     parts.push(
       `Latest turn: state=${turn.state} started=${turn.startedAt ?? "n/a"} completed=${turn.completedAt ?? "n/a"}`,
     );
+  }
+  if (thread.branch) {
+    parts.push(`Branch: ${thread.branch}`);
+  }
+  if (thread.worktreePath) {
+    parts.push(`Worktree: ${thread.worktreePath}`);
   }
   if (thread.session?.lastError) {
     parts.push(`Session error: ${truncate(thread.session.lastError)}`);
@@ -394,7 +405,9 @@ export function registerTools(server: McpServer, client: T3Client): void {
     "t3_send_prompt",
     "Create a T3 Code thread and send it a coding task. Call t3_get_config first " +
       "to discover the configured provider instance IDs, model slugs, and model " +
-      "option IDs (capabilities.optionDescriptors) for modelOptions.",
+      "option IDs (capabilities.optionDescriptors) for modelOptions. Pass baseBranch " +
+      "to create an isolated git worktree, or worktreePath to reuse one; " +
+      "t3_list_threads and t3_get_thread report each thread's branch and worktree.",
     {
       prompt: z.string().min(1).describe("Coding task or question to send to T3 Code"),
       projectId: z
@@ -429,6 +442,44 @@ export function registerTools(server: McpServer, client: T3Client): void {
         .enum(["default", "plan"])
         .optional()
         .describe("Provider interaction mode. Defaults to default."),
+      branch: z
+        .string()
+        .min(1)
+        .optional()
+        .describe(
+          "Branch name to record on the thread. With baseBranch, T3 creates the " +
+            "new worktree on this new branch. With worktreePath, it records the " +
+            "branch of the reused worktree.",
+        ),
+      worktreePath: z
+        .string()
+        .min(1)
+        .optional()
+        .describe(
+          "Absolute path of an existing git worktree for the thread to reuse. " +
+            "Cannot be combined with baseBranch.",
+        ),
+      baseBranch: z
+        .string()
+        .min(1)
+        .optional()
+        .describe(
+          "Base branch (e.g. main) for T3 to create a fresh git worktree from " +
+            "the project checkout. Requires a git repository. The worktree stays " +
+            "on disk after the thread settles; remove it with git worktree remove " +
+            "when done. Cannot be combined with worktreePath.",
+        ),
+      startFromOrigin: z
+        .boolean()
+        .optional()
+        .describe("Fetch baseBranch from origin before creating the worktree. Only with baseBranch."),
+      runSetupScript: z
+        .boolean()
+        .optional()
+        .describe(
+          "Run the project's setup script in a created worktree. Defaults to true. " +
+            "Only with baseBranch.",
+        ),
       waitMs: z
         .number()
         .int()
@@ -446,6 +497,11 @@ export function registerTools(server: McpServer, client: T3Client): void {
       modelOptions,
       runtimeMode,
       interactionMode,
+      branch,
+      worktreePath,
+      baseBranch,
+      startFromOrigin,
+      runSetupScript,
       waitMs,
     }) => {
       try {
@@ -459,7 +515,19 @@ export function registerTools(server: McpServer, client: T3Client): void {
             ? { options: modelOptions }
             : {}),
         };
+
+        if (worktreePath && baseBranch) {
+          throw new Error("worktreePath (reuse) and baseBranch (create) are mutually exclusive");
+        }
+        if (startFromOrigin && !baseBranch) {
+          throw new Error("startFromOrigin requires baseBranch");
+        }
+        if (runSetupScript === true && !baseBranch) {
+          throw new Error("runSetupScript requires baseBranch");
+        }
+
         let resolvedProjectId = projectId;
+        let projectCwd = workspaceRoot;
 
         if (!resolvedProjectId) {
           if (!workspaceRoot) {
@@ -477,46 +545,118 @@ export function registerTools(server: McpServer, client: T3Client): void {
             defaultModelSelection: modelSelection,
             createdAt: now(),
           });
+        } else if (baseBranch && !projectCwd) {
+          const project = (await client.getReadModel()).projects.find(
+            (candidate) => candidate.id === resolvedProjectId,
+          );
+          if (!project) {
+            throw new Error(`Project not found: ${resolvedProjectId}`);
+          }
+          projectCwd = project.workspaceRoot;
         }
 
         const threadId = randomUUID();
+        const title = prompt.slice(0, 80);
+        const threadBranch = branch ?? null;
+        let worktreeSummary: string;
 
-        await client.dispatchCommand({
-          type: "thread.create",
-          commandId: commandId(),
-          threadId,
-          projectId: resolvedProjectId,
-          title: prompt.slice(0, 80),
-          modelSelection,
-          runtimeMode: resolvedRuntimeMode,
-          interactionMode: resolvedInteractionMode,
-          branch: null,
-          worktreePath: null,
-          createdAt: now(),
-        });
+        if (baseBranch) {
+          // Native isolated-worktree flow: the server creates the thread and
+          // claims a fresh worktree path inside one turn.start bootstrap.
+          if (!projectCwd) {
+            throw new Error("baseBranch requires a project workspace root");
+          }
+          worktreeSummary = `Worktree: creating from ${baseBranch}${branch ? ` on new branch ${branch}` : ""}`;
+          await client.dispatchCommand({
+            type: "thread.turn.start",
+            commandId: commandId(),
+            threadId,
+            message: {
+              messageId: randomUUID(),
+              role: "user",
+              text: prompt,
+              attachments: [],
+            },
+            modelSelection,
+            runtimeMode: resolvedRuntimeMode,
+            interactionMode: resolvedInteractionMode,
+            bootstrap: {
+              createThread: {
+                projectId: resolvedProjectId,
+                title,
+                modelSelection,
+                runtimeMode: resolvedRuntimeMode,
+                interactionMode: resolvedInteractionMode,
+                branch: threadBranch,
+                worktreePath: null,
+                createdAt: now(),
+              },
+              prepareWorktree: {
+                projectCwd,
+                baseBranch,
+                ...(branch ? { branch } : {}),
+                ...(startFromOrigin ? { startFromOrigin: true } : {}),
+              },
+              ...((runSetupScript ?? true) ? { runSetupScript: true } : {}),
+            },
+            createdAt: now(),
+          });
+        } else {
+          worktreeSummary = worktreePath
+            ? `Worktree: reusing ${worktreePath}${branch ? ` (branch ${branch})` : ""}`
+            : branch
+              ? `Branch: ${branch} (project checkout)`
+              : "Worktree: project checkout";
 
-        await client.dispatchCommand({
-          type: "thread.turn.start",
-          commandId: commandId(),
-          threadId,
-          message: {
-            messageId: randomUUID(),
-            role: "user",
-            text: prompt,
-            attachments: [],
-          },
-          modelSelection,
-          runtimeMode: resolvedRuntimeMode,
-          interactionMode: resolvedInteractionMode,
-          createdAt: now(),
-        });
+          await client.dispatchCommand({
+            type: "thread.create",
+            commandId: commandId(),
+            threadId,
+            projectId: resolvedProjectId,
+            title,
+            modelSelection,
+            runtimeMode: resolvedRuntimeMode,
+            interactionMode: resolvedInteractionMode,
+            branch: threadBranch,
+            worktreePath: worktreePath ?? null,
+            createdAt: now(),
+          });
+
+          await client.dispatchCommand({
+            type: "thread.turn.start",
+            commandId: commandId(),
+            threadId,
+            message: {
+              messageId: randomUUID(),
+              role: "user",
+              text: prompt,
+              attachments: [],
+            },
+            modelSelection,
+            runtimeMode: resolvedRuntimeMode,
+            interactionMode: resolvedInteractionMode,
+            createdAt: now(),
+          });
+        }
 
         const events = await collectThreadEvents(client, threadId, waitMs ?? 30_000);
+
+        // Report the server-claimed worktree path when T3 created one.
+        let createdWorktreePath: string | null = null;
+        try {
+          const snapshot = await client.getThreadSnapshot(threadId);
+          createdWorktreePath = snapshot.thread.worktreePath;
+        } catch {
+          // The events below already carry the response; a missing snapshot
+          // must not fail the whole call.
+        }
 
         return textResult(
           [
             `Thread created: ${threadId}`,
             `Project: ${resolvedProjectId}`,
+            worktreeSummary,
+            ...(createdWorktreePath ? [`Worktree path: ${createdWorktreePath}`] : []),
             "",
             "Response events:",
             formatThreadEvents(events),

@@ -19,7 +19,9 @@ T3 v0.0.42 and supports both local stdio clients and a long-running Streamable H
 `t3_list_threads` and `t3_get_thread` use T3's supported HTTP orchestration API, so they
 work for threads created by any client and return the current state without waiting for
 new events. `t3_send_prompt` uses T3's native `instanceId + model` model selection with
-`modelSelection.options` for reasoning/effort choices. Call
+`modelSelection.options` for reasoning/effort choices. Pass `baseBranch` to
+create an isolated git worktree for the thread, or `worktreePath` to reuse an
+existing one. Call
 `t3_get_config` first instead of assuming a provider or model name.
 
 ## Authentication

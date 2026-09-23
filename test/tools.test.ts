@@ -116,6 +116,16 @@ describe("formatThreadRows", () => {
     expect(output).not.toContain("Archived");
   });
 
+  it("shows branch and worktree placement when set", () => {
+    const output = formatThreadRows(
+      readModel([thread({ branch: "feature-x", worktreePath: "/srv/work/wt-1" })]),
+    );
+
+    expect(output).toContain("branch=feature-x");
+    expect(output).toContain("worktree=/srv/work/wt-1");
+    expect(formatThreadRows(readModel([thread({})]))).not.toContain("branch=");
+  });
+
   it("reports when nothing matches", () => {
     expect(formatThreadRows(readModel([]))).toBe("(no threads exist)");
     expect(formatThreadRows(readModel([thread({})]), { query: "zzz" })).toBe(
@@ -188,6 +198,15 @@ describe("formatThreadDetail", () => {
     expect(output).toContain("turn=no-turns session=no-session");
     expect(output).toContain("Last messages: (none)");
     expect(output).toContain("Recent activities: (none)");
+  });
+
+  it("reports the thread branch and worktree when set", () => {
+    const output = formatThreadDetail({
+      snapshotSequence: 5,
+      thread: thread({ latestTurn: null, session: null, branch: "feature-x", worktreePath: "/srv/work/wt-1" }),
+    });
+    expect(output).toContain("Branch: feature-x");
+    expect(output).toContain("Worktree: /srv/work/wt-1");
   });
 });
 
