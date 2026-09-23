@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   formatThreadDetail,
   formatThreadRows,
+  formatUsageLimits,
   terminalEventTypes,
 } from "../src/tools.js";
 import type { T3ReadModel, T3ThreadDetailSnapshot } from "../src/t3client.js";
@@ -187,6 +188,73 @@ describe("formatThreadDetail", () => {
     expect(output).toContain("turn=no-turns session=no-session");
     expect(output).toContain("Last messages: (none)");
     expect(output).toContain("Recent activities: (none)");
+  });
+});
+
+describe("formatUsageLimits", () => {
+  const nowMs = Date.parse("2026-09-23T17:30:00.000Z");
+  const config = {
+    providers: [
+      {
+        instanceId: "codex",
+        displayName: "Codex",
+        status: "ready",
+        enabled: true,
+        auth: { label: "ChatGPT Plus Subscription" },
+        usageLimits: {
+          checkedAt: "2026-09-23T17:27:14.002Z",
+          windows: [
+            {
+              id: "primary",
+              kind: "session" as const,
+              label: "Session",
+              usedPercent: 93,
+              windowDurationMins: 300,
+              resetsAt: "2026-09-23T19:08:14.000Z",
+            },
+            {
+              id: "secondary",
+              kind: "weekly" as const,
+              label: "Weekly",
+              usedPercent: 28,
+              windowDurationMins: 10080,
+              resetsAt: "2026-09-29T15:08:47.000Z",
+            },
+          ],
+          resetCredits: { availableCount: 1 },
+        },
+      },
+      {
+        instanceId: "claudeAgent",
+        displayName: "Claude",
+        status: "ready",
+        enabled: true,
+        usageLimits: {
+          checkedAt: "2026-09-23T17:26:29.144Z",
+          windows: [
+            { id: "five_hour", kind: "session" as const, usedPercent: 100, resetsAt: "2026-09-23T19:00:00.008Z" },
+            { id: "seven_day", kind: "weekly" as const, usedPercent: 53, resetsAt: "2026-09-26T15:00:00.008Z" },
+          ],
+        },
+      },
+      { instanceId: "opencode", displayName: "OpenCode", status: "ready", enabled: true },
+    ],
+  };
+
+  it("reports session and weekly usage with reset times", () => {
+    const output = formatUsageLimits(config, nowMs);
+    expect(output).toContain("Codex (ChatGPT Plus Subscription)");
+    expect(output).toContain("Session: 5h window 93% used, resets in 1h39m");
+    expect(output).toContain("Weekly: 168h window 28% used, resets in 5d21h");
+    expect(output).toContain("Session: 100% used, resets in 1h31m");
+    expect(output).toContain("Weekly: 53% used, resets in 2d21h");
+    expect(output).toContain("Reset credits available: 1");
+  });
+
+  it("lists providers without usage data and handles an empty config", () => {
+    const output = formatUsageLimits(config, nowMs);
+    expect(output).toContain("No usage data: OpenCode");
+    expect(formatUsageLimits({}, nowMs)).toBe("(no usage limits reported)");
   });
 });
 

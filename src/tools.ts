@@ -208,6 +208,107 @@ function formatThreadEvents(events: unknown[]): string {
   return parts.join("\n") || "(events captured but no readable content)";
 }
 
+/** Minimal shape of T3 provider usage limits as returned by server.getConfig. */
+export interface T3UsageLimitWindow {
+  id?: string;
+  kind?: "session" | "weekly" | "monthly" | "other";
+  label?: string;
+  usedPercent?: number;
+  resetsAt?: string | null;
+  windowDurationMins?: number;
+}
+
+/** Minimal shape of T3 provider usage limits as returned by server.getConfig. */
+export interface T3UsageLimits {
+  checkedAt?: string;
+  unavailable?: { reason?: string; message?: string } | null;
+  windows?: T3UsageLimitWindow[];
+  resetCredits?: { availableCount?: number } | null;
+}
+
+export interface T3UsageLimitSource {
+  providers?: Array<{
+    instanceId?: string;
+    displayName?: string;
+    status?: string;
+    enabled?: boolean;
+    auth?: { label?: string; email?: string };
+    usageLimits?: T3UsageLimits | null;
+  }>;
+}
+
+/** Humanize the wait until an ISO reset instant, e.g. "1h41m". */
+export function formatRemaining(resetsAt: string, nowMs: number): string {
+  const target = Date.parse(resetsAt);
+  if (!Number.isFinite(target)) return "unknown";
+
+  const ms = target - nowMs;
+  if (ms <= 0) return "now";
+
+  const minutes = Math.ceil(ms / 60_000);
+  const days = Math.floor(minutes / 1440);
+  const hours = Math.floor((minutes % 1440) / 60);
+  const mins = minutes % 60;
+  const parts = [
+    ...(days > 0 ? [`${days}d`] : []),
+    ...(hours > 0 ? [`${hours}h`] : []),
+    ...(days === 0 && mins > 0 ? [`${mins}m`] : []),
+  ];
+  return parts.join("") || "now";
+}
+
+/** Kind label for a usage limit window, preferring the 5h session form. */
+function windowLabel(win: T3UsageLimitWindow): string {
+  if (win.label) return win.label;
+  if (win.kind === "session") return "Session";
+  if (win.kind === "weekly") return "Weekly";
+  if (win.kind === "monthly") return "Monthly";
+  return win.id ?? "Window";
+}
+
+/** Format the server config's provider usage limits into readable rows. */
+export function formatUsageLimits(config: T3UsageLimitSource, nowMs = Date.now()): string {
+  const providers = config.providers ?? [];
+  const lines: string[] = [];
+
+  const withLimits = providers.filter((p) => p.usageLimits?.windows?.length);
+  const withoutLimits = providers.filter(
+    (p) => p.enabled !== false && p.status !== "disabled" && !p.usageLimits?.windows?.length,
+  );
+
+  for (const provider of withLimits) {
+    const auth = provider.auth ? [provider.auth.label, provider.auth.email].filter(Boolean).join(" — ") : "";
+    lines.push(`${provider.displayName ?? provider.instanceId ?? "provider"}${auth ? ` (${auth})` : ""}`);
+
+    const limits = provider.usageLimits!;
+    for (const win of limits.windows ?? []) {
+      if (typeof win.usedPercent !== "number") continue;
+      const label = windowLabel(win);
+      const duration = win.windowDurationMins ? ` ${Math.round(win.windowDurationMins / 60)}h window` : "";
+      const reset = win.resetsAt
+        ? `, resets in ${formatRemaining(win.resetsAt, nowMs)} (at ${win.resetsAt})`
+        : "";
+      lines.push(`  ${label}:${duration} ${Math.round(win.usedPercent)}% used${reset}`);
+    }
+
+    const credits = limits.resetCredits?.availableCount;
+    if (credits && credits > 0) {
+      lines.push(`  Reset credits available: ${credits}`);
+    }
+
+    if (limits.unavailable?.message) {
+      lines.push(`  Unavailable: ${limits.unavailable.message}`);
+    }
+  }
+
+  if (withoutLimits.length > 0) {
+    lines.push(`No usage data: ${withoutLimits.map((p) => p.displayName ?? p.instanceId).join(", ")}`);
+  }
+
+  if (lines.length === 0) return "(no usage limits reported)";
+  return lines.join("\n");
+}
+
 function errorResult(error: unknown) {
   return {
     isError: true,
@@ -492,6 +593,21 @@ export function registerTools(server: McpServer, client: T3Client): void {
           createdAt: now(),
         });
         return textResult(`Session stop dispatched. Sequence: ${result.sequence}`);
+      } catch (error) {
+        return errorResult(error);
+      }
+    },
+  );
+
+  server.tool(
+    "t3_get_usage_limits",
+    "Get provider subscription usage limits for T3 Code, especially Codex " +
+      "(ChatGPT) and Claude Code. Reports used percent and reset time for the " +
+      "5 hour session quota and the weekly quota.",
+    {},
+    async () => {
+      try {
+        return textResult(formatUsageLimits(await client.getConfig() as T3UsageLimitSource));
       } catch (error) {
         return errorResult(error);
       }

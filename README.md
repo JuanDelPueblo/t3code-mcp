@@ -8,6 +8,7 @@ T3 v0.0.42 and supports both local stdio clients and a long-running Streamable H
 ## MCP tools
 
 - `t3_get_config` — inspect configured provider instances and model catalogs
+- `t3_get_usage_limits` — provider subscription usage (Codex/ChatGPT, Claude Code): 5 hour session and weekly quota used, with reset times
 - `t3_list_threads` — discover existing threads with their current state, including threads started from the T3 UI or another client
 - `t3_get_thread` — immediate current snapshot of one thread: state, latest turn, messages, activities
 - `t3_send_prompt` — create a project/thread and start a coding turn
