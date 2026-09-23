@@ -3,18 +3,47 @@
 MCP server for orchestrating [T3 Code](https://github.com/pingdotgg/t3code).
 
 This fork targets the current T3 Code authentication and orchestration protocol used by
-T3 v0.0.40 and supports both local stdio clients and a long-running Streamable HTTP service.
+T3 v0.0.42 and supports both local stdio clients and a long-running Streamable HTTP service.
 
 ## MCP tools
 
 - `t3_get_config` — inspect configured provider instances and model catalogs
+- `t3_list_threads` — discover existing threads with their current state, including threads started from the T3 UI or another client
+- `t3_get_thread` — immediate current snapshot of one thread: state, latest turn, messages, activities
 - `t3_send_prompt` — create a project/thread and start a coding turn
-- `t3_get_status` — collect recent thread events
+- `t3_get_status` — immediate thread snapshot plus optional live event tail
 - `t3_interrupt` — interrupt a running turn
 - `t3_stop_session` — stop a provider session
 
-`t3_send_prompt` uses T3's native `instanceId + model` model selection. Call
+`t3_list_threads` and `t3_get_thread` use T3's supported HTTP orchestration API, so they
+work for threads created by any client and return the current state without waiting for
+new events. `t3_send_prompt` uses T3's native `instanceId + model` model selection. Call
 `t3_get_config` first instead of assuming a provider or model name.
+
+## Discord notification bridge
+
+The package also ships a `t3code-notify` binary. It polls T3's HTTP orchestration read
+model and posts to a Discord webhook when a thread settles (turn finished, failed, or
+stopped) or requests approval or user input. It observes threads started from any client
+and does not read T3's private database state.
+
+```bash
+T3_CODE_URL=http://127.0.0.1:8731 \
+T3_CODE_BASE_DIR=/var/lib/t3code \
+T3CODE_URL=https://t3.example.com \
+T3CODE_DISCORD_WEBHOOK_URL='https://discord.com/api/webhooks/...' \
+t3code-notify
+```
+
+Variables:
+
+- `T3CODE_DISCORD_WEBHOOK_URL` (or `T3CODE_DISCORD_WEBHOOK_URL_FILE`) — Discord webhook, required
+- `T3_CODE_URL` — T3 server URL, default `http://127.0.0.1:3000`
+- `T3CODE_URL` — public T3 origin appended to each message, default `T3_CODE_URL`
+- `T3_NOTIFY_POLL_MS` — poll interval, default `5000`
+- Authentication is shared with the MCP server; see below
+
+The first poll only records a baseline, so restarts do not replay old notifications.
 
 ## Authentication
 
@@ -107,17 +136,27 @@ write access to the T3 base directory for local pairing; MCP clients do not.
 npm ci
 npm run typecheck
 npm run build
+npm test
 ```
 
 ## Protocol notes
 
-T3 v0.0.40 uses:
+T3 v0.0.42 uses:
 
 - OAuth token exchange at `/oauth/token`
 - WebSocket tickets at `/api/auth/websocket-ticket`
-- `/ws?wsTicket=...&orchestrationProtocol=1`
+- `/ws?wsTicket=...` (the old `orchestrationProtocol` parameter is gone)
 - Effect RPC JSON messages with `requestId` on responses
 - batched stream `Chunk.values` with client acknowledgements
+- `orchestration.subscribeThread` streams `{kind: "snapshot"}`, `{kind: "synchronized"}`,
+  and `{kind: "event"}` items
+- HTTP orchestration API with bearer auth:
+  - `GET /api/orchestration/snapshot` — full read model of projects and threads
+  - `GET /api/orchestration/threads/:threadId` — one thread's detail snapshot
+  - `POST /api/orchestration/dispatch` — command dispatch
+
+Thread discovery and status tools use the HTTP API instead of private state, so upgrades
+of T3 do not silently break the integration.
 
 ## License
 
