@@ -18,33 +18,9 @@ T3 v0.0.42 and supports both local stdio clients and a long-running Streamable H
 
 `t3_list_threads` and `t3_get_thread` use T3's supported HTTP orchestration API, so they
 work for threads created by any client and return the current state without waiting for
-new events. `t3_send_prompt` uses T3's native `instanceId + model` model selection. Call
+new events. `t3_send_prompt` uses T3's native `instanceId + model` model selection with
+`modelSelection.options` for reasoning/effort choices. Call
 `t3_get_config` first instead of assuming a provider or model name.
-
-## Discord notification bridge
-
-The package also ships a `t3code-notify` binary. It polls T3's HTTP orchestration read
-model and posts to a Discord webhook when a thread settles (turn finished, failed, or
-stopped) or requests approval or user input. It observes threads started from any client
-and does not read T3's private database state.
-
-```bash
-T3_CODE_URL=http://127.0.0.1:8731 \
-T3_CODE_BASE_DIR=/var/lib/t3code \
-T3CODE_URL=https://t3.example.com \
-T3CODE_DISCORD_WEBHOOK_URL='https://discord.com/api/webhooks/...' \
-t3code-notify
-```
-
-Variables:
-
-- `T3CODE_DISCORD_WEBHOOK_URL` (or `T3CODE_DISCORD_WEBHOOK_URL_FILE`) — Discord webhook, required
-- `T3_CODE_URL` — T3 server URL, default `http://127.0.0.1:3000`
-- `T3CODE_URL` — public T3 origin appended to each message, default `T3_CODE_URL`
-- `T3_NOTIFY_POLL_MS` — poll interval, default `5000`
-- Authentication is shared with the MCP server; see below
-
-The first poll only records a baseline, so restarts do not replay old notifications.
 
 ## Authentication
 

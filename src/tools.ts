@@ -393,7 +393,8 @@ export function registerTools(server: McpServer, client: T3Client): void {
   server.tool(
     "t3_send_prompt",
     "Create a T3 Code thread and send it a coding task. Call t3_get_config first " +
-      "to discover the configured provider instance IDs and model slugs.",
+      "to discover the configured provider instance IDs, model slugs, and model " +
+      "option IDs (capabilities.optionDescriptors) for modelOptions.",
     {
       prompt: z.string().min(1).describe("Coding task or question to send to T3 Code"),
       projectId: z
@@ -411,6 +412,15 @@ export function registerTools(server: McpServer, client: T3Client): void {
         .min(1)
         .describe("Configured T3 provider instance ID returned by t3_get_config"),
       model: z.string().min(1).describe("Model slug returned by t3_get_config"),
+      modelOptions: z
+        .record(z.string(), z.union([z.string(), z.boolean()]))
+        .optional()
+        .describe(
+          "Model option values keyed by option ID from the model's " +
+            "capabilities.optionDescriptors in t3_get_config (e.g. reasoningEffort " +
+            "for Codex, effort for Claude, variant for OpenCode; also serviceTier, " +
+            "fastMode, contextWindow, agent). Omit to use T3 defaults.",
+        ),
       runtimeMode: z
         .enum(["approval-required", "auto-accept-edits", "auto", "full-access"])
         .optional()
@@ -433,6 +443,7 @@ export function registerTools(server: McpServer, client: T3Client): void {
       workspaceRoot,
       instanceId,
       model,
+      modelOptions,
       runtimeMode,
       interactionMode,
       waitMs,
@@ -440,7 +451,14 @@ export function registerTools(server: McpServer, client: T3Client): void {
       try {
         const resolvedRuntimeMode = runtimeMode ?? "full-access";
         const resolvedInteractionMode = interactionMode ?? "default";
-        const modelSelection = { instanceId, model };
+        // T3 accepts modelSelection.options as a plain {id: value} object.
+        const modelSelection = {
+          instanceId,
+          model,
+          ...(modelOptions && Object.keys(modelOptions).length > 0
+            ? { options: modelOptions }
+            : {}),
+        };
         let resolvedProjectId = projectId;
 
         if (!resolvedProjectId) {

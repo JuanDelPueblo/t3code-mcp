@@ -27,6 +27,7 @@ function createMcpServer(): McpServer {
         "2. Call t3_list_threads to discover existing threads, including threads",
         "   started from the T3 UI or another client.",
         "3. Call t3_send_prompt with an instanceId, model, and project/workspace.",
+        "   Pass modelOptions for reasoning/effort choices from t3_get_config.",
         "4. Inspect current state with t3_get_thread or t3_get_status; both return",
         "   an immediate snapshot and work for threads from any client.",
         "5. Use t3_interrupt or t3_stop_session for lifecycle control.",

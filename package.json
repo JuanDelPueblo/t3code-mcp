@@ -5,8 +5,7 @@
   "license": "MIT",
   "type": "module",
   "bin": {
-    "t3code-mcp": "./dist/index.js",
-    "t3code-notify": "./dist/notify.js"
+    "t3code-mcp": "./dist/index.js"
   },
   "main": "./dist/index.js",
   "scripts": {
