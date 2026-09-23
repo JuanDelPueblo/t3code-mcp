@@ -19,10 +19,40 @@ T3 v0.0.42 and supports both local stdio clients and a long-running Streamable H
 `t3_list_threads` and `t3_get_thread` use T3's supported HTTP orchestration API, so they
 work for threads created by any client and return the current state without waiting for
 new events. `t3_send_prompt` uses T3's native `instanceId + model` model selection with
-`modelSelection.options` for reasoning/effort choices. Pass `baseBranch` to
-create an isolated git worktree for the thread, or `worktreePath` to reuse an
-existing one. Call
+`modelSelection.options` for reasoning/effort choices. Call
 `t3_get_config` first instead of assuming a provider or model name.
+
+## Sending prompts
+
+`t3_send_prompt` creates a project/thread and starts a coding turn. It accepts
+two option groups beyond the prompt, model, and project.
+
+Model options: pass `modelOptions` as an object keyed by option ID. Read the
+valid IDs and values from the model's `capabilities.optionDescriptors` in
+`t3_get_config`. Common IDs are:
+
+- Reasoning: `reasoningEffort` (Codex), `effort` (Claude), `variant` (OpenCode)
+- `serviceTier` (Codex), `fastMode` and `contextWindow` (Claude), `agent` (OpenCode)
+
+Example: `{"effort": "high", "fastMode": true}`. Omit `modelOptions` to use
+T3 defaults.
+
+Worktrees: pass `baseBranch` (for example `main`) to create an isolated git
+worktree for the thread. T3 checks out the worktree from the project
+repository and reports the claimed path in the result. Optional refinements:
+
+- `branch` — name the new branch (create mode), record the branch of a reused
+  worktree (reuse mode), or record a branch on the project checkout
+- `worktreePath` — reuse an existing worktree instead of creating one; it
+  cannot combine with `baseBranch`
+- `startFromOrigin` — fetch `baseBranch` from origin before creating
+- `runSetupScript` — run the project setup script in a created worktree;
+  defaults to true
+
+`t3_list_threads` and `t3_get_thread` report each thread's branch and
+worktree, so a later prompt can reuse the reported `worktreePath`. T3 leaves
+created worktrees on disk after the thread settles. Remove them with
+`git worktree remove` when done.
 
 ## Authentication
 
