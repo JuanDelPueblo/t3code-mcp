@@ -5,7 +5,21 @@
 import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { T3Client, type T3ReadModel, type T3ThreadDetailSnapshot } from "./t3client.js";
+import {
+  T3Client,
+  type T3ReadModel,
+  type T3Thread,
+  type T3ThreadDetailSnapshot,
+} from "./t3client.js";
+import {
+  collectUsageReport,
+  formatUsageReport,
+  usageReportFromConfig,
+  type T3UsageLimitSource,
+  type UsageProbeOptions,
+} from "./usage.js";
+
+export type { T3UsageLimitSource } from "./usage.js";
 
 function now(): string {
   return new Date().toISOString();
@@ -113,6 +127,11 @@ export function formatThreadRows(
     .join("\n");
 }
 
+/** The last `limit` items. `slice(-0)` returns every item, so handle 0 apart. */
+function lastItems<T>(items: T[], limit: number): T[] {
+  return limit > 0 ? items.slice(-limit) : [];
+}
+
 /** Format an HTTP thread detail snapshot for t3_get_thread / t3_get_status. */
 export function formatThreadDetail(
   snapshot: T3ThreadDetailSnapshot,
@@ -149,7 +168,7 @@ export function formatThreadDetail(
   const messages = thread.messages ?? [];
   if (messages.length > 0) {
     parts.push(`Last messages (${Math.min(messageLimit, messages.length)} of ${messages.length}):`);
-    for (const message of messages.slice(-messageLimit)) {
+    for (const message of lastItems(messages, messageLimit)) {
       parts.push(`  [${message.role ?? "unknown"}] ${truncate(String(message.text ?? ""))}`);
     }
   } else {
@@ -159,7 +178,7 @@ export function formatThreadDetail(
   const activities = thread.activities ?? [];
   if (activities.length > 0) {
     parts.push(`Recent activities (${Math.min(activityLimit, activities.length)} of ${activities.length}):`);
-    for (const activity of activities.slice(-activityLimit)) {
+    for (const activity of lastItems(activities, activityLimit)) {
       parts.push(`  [${activity.kind}] ${truncate(activity.summary ?? "", 300)}`);
     }
   } else {
@@ -219,105 +238,72 @@ function formatThreadEvents(events: unknown[]): string {
   return parts.join("\n") || "(events captured but no readable content)";
 }
 
-/** Minimal shape of T3 provider usage limits as returned by server.getConfig. */
-export interface T3UsageLimitWindow {
-  id?: string;
-  kind?: "session" | "weekly" | "monthly" | "other";
-  label?: string;
-  usedPercent?: number;
-  resetsAt?: string | null;
-  windowDurationMins?: number;
-}
+const usageWindowSchema = z.object({
+  id: z.string(),
+  kind: z.enum(["session", "weekly", "monthly", "other"]),
+  label: z.string(),
+  usedPercent: z.number(),
+  remainingPercent: z.number(),
+  resetsAt: z.string().nullable(),
+  windowMinutes: z.number().nullable(),
+});
 
-/** Minimal shape of T3 provider usage limits as returned by server.getConfig. */
-export interface T3UsageLimits {
-  checkedAt?: string;
-  unavailable?: { reason?: string; message?: string } | null;
-  windows?: T3UsageLimitWindow[];
-  resetCredits?: { availableCount?: number } | null;
-}
+/** Output schema of t3_get_usage_limits. Mirrors UsageReport in usage.ts. */
+export const usageReportOutputSchema = {
+  checkedAt: z.string(),
+  providers: z.array(
+    z.object({
+      provider: z.string(),
+      instanceId: z.string().nullable(),
+      displayName: z.string(),
+      plan: z.string().nullable(),
+      source: z.enum(["t3", "antigravity-cli", "opencode-go-api"]),
+      available: z.boolean(),
+      reason: z.string().nullable(),
+      checkedAt: z.string().nullable(),
+      resetCredits: z.number().nullable(),
+      pools: z.array(
+        z.object({
+          id: z.string(),
+          name: z.string().nullable(),
+          models: z.string().nullable(),
+          windows: z.array(usageWindowSchema),
+        }),
+      ),
+    }),
+  ),
+  noUsageData: z.array(z.string()),
+};
 
-export interface T3UsageLimitSource {
-  providers?: Array<{
-    instanceId?: string;
-    displayName?: string;
-    status?: string;
-    enabled?: boolean;
-    auth?: { label?: string; email?: string };
-    usageLimits?: T3UsageLimits | null;
-  }>;
-}
-
-/** Humanize the wait until an ISO reset instant, e.g. "1h41m". */
-export function formatRemaining(resetsAt: string, nowMs: number): string {
-  const target = Date.parse(resetsAt);
-  if (!Number.isFinite(target)) return "unknown";
-
-  const ms = target - nowMs;
-  if (ms <= 0) return "now";
-
-  const minutes = Math.ceil(ms / 60_000);
-  const days = Math.floor(minutes / 1440);
-  const hours = Math.floor((minutes % 1440) / 60);
-  const mins = minutes % 60;
-  const parts = [
-    ...(days > 0 ? [`${days}d`] : []),
-    ...(hours > 0 ? [`${hours}h`] : []),
-    ...(days === 0 && mins > 0 ? [`${mins}m`] : []),
-  ];
-  return parts.join("") || "now";
-}
-
-/** Kind label for a usage limit window, preferring the 5h session form. */
-function windowLabel(win: T3UsageLimitWindow): string {
-  if (win.label) return win.label;
-  if (win.kind === "session") return "Session";
-  if (win.kind === "weekly") return "Weekly";
-  if (win.kind === "monthly") return "Monthly";
-  return win.id ?? "Window";
-}
-
-/** Format the server config's provider usage limits into readable rows. */
+/** Format the server config's provider usage limits into readable rows, with no probes. */
 export function formatUsageLimits(config: T3UsageLimitSource, nowMs = Date.now()): string {
-  const providers = config.providers ?? [];
-  const lines: string[] = [];
+  return formatUsageReport(usageReportFromConfig(config), nowMs);
+}
 
-  const withLimits = providers.filter((p) => p.usageLimits?.windows?.length);
-  const withoutLimits = providers.filter(
-    (p) => p.enabled !== false && p.status !== "disabled" && !p.usageLimits?.windows?.length,
-  );
-
-  for (const provider of withLimits) {
-    const auth = provider.auth ? [provider.auth.label, provider.auth.email].filter(Boolean).join(" — ") : "";
-    lines.push(`${provider.displayName ?? provider.instanceId ?? "provider"}${auth ? ` (${auth})` : ""}`);
-
-    const limits = provider.usageLimits!;
-    for (const win of limits.windows ?? []) {
-      if (typeof win.usedPercent !== "number") continue;
-      const label = windowLabel(win);
-      const duration = win.windowDurationMins ? ` ${Math.round(win.windowDurationMins / 60)}h window` : "";
-      const reset = win.resetsAt
-        ? `, resets in ${formatRemaining(win.resetsAt, nowMs)} (at ${win.resetsAt})`
-        : "";
-      lines.push(`  ${label}:${duration} ${Math.round(win.usedPercent)}% used${reset}`);
-    }
-
-    const credits = limits.resetCredits?.availableCount;
-    if (credits && credits > 0) {
-      lines.push(`  Reset credits available: ${credits}`);
-    }
-
-    if (limits.unavailable?.message) {
-      lines.push(`  Unavailable: ${limits.unavailable.message}`);
-    }
-  }
-
-  if (withoutLimits.length > 0) {
-    lines.push(`No usage data: ${withoutLimits.map((p) => p.displayName ?? p.instanceId).join(", ")}`);
-  }
-
-  if (lines.length === 0) return "(no usage limits reported)";
-  return lines.join("\n");
+/**
+ * Build the command for a follow-up turn on an existing thread. T3 takes the
+ * runtime and interaction modes of the thread for the new turn, so send the
+ * values of the thread. Omit modelSelection so the thread keeps its model.
+ */
+export function followUpTurnCommand(
+  thread: Pick<T3Thread, "id" | "runtimeMode" | "interactionMode">,
+  prompt: string,
+  ids: { commandId: string; messageId: string; createdAt: string },
+) {
+  return {
+    type: "thread.turn.start",
+    commandId: ids.commandId,
+    threadId: thread.id,
+    message: {
+      messageId: ids.messageId,
+      role: "user",
+      text: prompt,
+      attachments: [],
+    },
+    runtimeMode: thread.runtimeMode,
+    interactionMode: thread.interactionMode,
+    createdAt: ids.createdAt,
+  };
 }
 
 function errorResult(error: unknown) {
@@ -338,7 +324,11 @@ function textResult(text: string) {
   };
 }
 
-export function registerTools(server: McpServer, client: T3Client): void {
+export function registerTools(
+  server: McpServer,
+  client: T3Client,
+  usageOptions: UsageProbeOptions,
+): void {
   server.tool(
     "t3_list_threads",
     "List existing T3 Code threads with their current state, including threads " +
@@ -669,6 +659,67 @@ export function registerTools(server: McpServer, client: T3Client): void {
   );
 
   server.tool(
+    "t3_send_message",
+    "Send a follow-up message to an existing T3 Code thread and start a new turn " +
+      "in the same provider session, so the agent keeps its context. The turn " +
+      "uses the model, runtime mode, interaction mode, and worktree of the thread. " +
+      "Fails when a turn is still running; wait, or call t3_interrupt first.",
+    {
+      threadId: z.string().min(1).describe("Thread ID from t3_send_prompt or t3_list_threads"),
+      prompt: z.string().min(1).describe("Message to send to the agent of the thread"),
+      waitMs: z
+        .number()
+        .int()
+        .min(0)
+        .max(120_000)
+        .optional()
+        .describe("Milliseconds to collect response events before returning. Default 30000."),
+    },
+    async ({ threadId, prompt, waitMs }) => {
+      try {
+        const snapshot = await client.getThreadSnapshot(threadId);
+        const thread = snapshot.thread;
+        if (thread.deletedAt !== null) {
+          throw new Error(`Thread ${threadId} is deleted`);
+        }
+        if (thread.latestTurn?.state === "running") {
+          throw new Error(
+            `Thread ${threadId} has a running turn (${thread.latestTurn.turnId}). ` +
+              "Wait for it to finish, or call t3_interrupt first.",
+          );
+        }
+
+        const result = await client.dispatchCommand(
+          followUpTurnCommand(thread, prompt, {
+            commandId: commandId(),
+            messageId: randomUUID(),
+            createdAt: now(),
+          }),
+        );
+        // Start after the pre-dispatch snapshot, so the tail holds only this turn.
+        const events = await collectThreadEvents(
+          client,
+          threadId,
+          waitMs ?? 30_000,
+          snapshot.snapshotSequence,
+        );
+
+        return textResult(
+          [
+            `Message sent to thread ${threadId} (sequence ${result.sequence})`,
+            ...(thread.worktreePath ? [`Worktree: ${thread.worktreePath}`] : []),
+            "",
+            "Response events:",
+            formatThreadEvents(events),
+          ].join("\n"),
+        );
+      } catch (error) {
+        return errorResult(error);
+      }
+    },
+  );
+
+  server.tool(
     "t3_get_status",
     "Get the current state of a T3 Code thread: an immediate snapshot plus, " +
       "optionally, live events collected for waitMs milliseconds.",
@@ -757,15 +808,26 @@ export function registerTools(server: McpServer, client: T3Client): void {
     },
   );
 
-  server.tool(
+  server.registerTool(
     "t3_get_usage_limits",
-    "Get provider subscription usage limits for T3 Code, especially Codex " +
-      "(ChatGPT) and Claude Code. Reports used percent and reset time for the " +
-      "5 hour session quota and the weekly quota.",
-    {},
+    {
+      description:
+        "Get provider subscription usage limits: Codex (ChatGPT) and Claude Code " +
+        "from T3, plus Antigravity and OpenCode Go from their own usage sources " +
+        "when configured. Reports used and remaining percent and the reset time " +
+        "for each quota window (5h session, rolling, weekly, monthly). Models in " +
+        "one pool share its windows. structuredContent holds the same data as JSON.",
+      inputSchema: {},
+      outputSchema: usageReportOutputSchema,
+    },
     async () => {
       try {
-        return textResult(formatUsageLimits(await client.getConfig() as T3UsageLimitSource));
+        const config = (await client.getConfig()) as T3UsageLimitSource;
+        const report = await collectUsageReport(config, usageOptions);
+        return {
+          content: [{ type: "text" as const, text: formatUsageReport(report) }],
+          structuredContent: report as unknown as Record<string, unknown>,
+        };
       } catch (error) {
         return errorResult(error);
       }

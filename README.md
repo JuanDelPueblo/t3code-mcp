@@ -8,10 +8,11 @@ T3 v0.0.42 and supports both local stdio clients and a long-running Streamable H
 ## MCP tools
 
 - `t3_get_config` — inspect configured provider instances and model catalogs
-- `t3_get_usage_limits` — provider subscription usage (Codex/ChatGPT, Claude Code): 5 hour session and weekly quota used, with reset times
+- `t3_get_usage_limits` — provider subscription usage: Codex/ChatGPT and Claude Code from T3, plus Antigravity and OpenCode Go from their own usage sources. Text plus `structuredContent`
 - `t3_list_threads` — discover existing threads with their current state, including threads started from the T3 UI or another client
 - `t3_get_thread` — immediate current snapshot of one thread: state, latest turn, messages, activities
 - `t3_send_prompt` — create a project/thread and start a coding turn
+- `t3_send_message` — start a follow-up turn in an existing thread, in the same provider session
 - `t3_get_status` — immediate thread snapshot plus optional live event tail
 - `t3_interrupt` — interrupt a running turn
 - `t3_stop_session` — stop a provider session
@@ -53,6 +54,87 @@ repository and reports the claimed path in the result. Optional refinements:
 worktree, so a later prompt can reuse the reported `worktreePath`. T3 leaves
 created worktrees on disk after the thread settles. Remove them with
 `git worktree remove` when done.
+
+## Follow-up messages
+
+`t3_send_message` sends a new message to an existing thread. The agent
+continues in the same provider session, so it keeps its context, and the turn
+uses the model, runtime mode, interaction mode, and worktree of the thread.
+Use it to send review findings back to the agent that did the work.
+
+The tool refuses a thread with a running turn. Wait for the turn to settle, or
+call `t3_interrupt` first.
+
+## Usage limits
+
+`t3_get_usage_limits` returns readable text and the same data as
+`structuredContent`:
+
+```json
+{
+  "checkedAt": "2026-09-25T23:30:00.000Z",
+  "providers": [
+    {
+      "provider": "antigravity",
+      "instanceId": "antigravity",
+      "displayName": "Antigravity",
+      "plan": null,
+      "source": "antigravity-cli",
+      "available": true,
+      "reason": null,
+      "checkedAt": "2026-09-25T23:30:00.000Z",
+      "resetCredits": null,
+      "pools": [
+        {
+          "id": "gemini-models",
+          "name": "Gemini Models",
+          "models": "Gemini Flash, Gemini Pro",
+          "windows": [
+            {
+              "id": "gemini-5h",
+              "kind": "session",
+              "label": "Session",
+              "usedPercent": 21,
+              "remainingPercent": 79,
+              "resetsAt": "2026-09-26T00:10:54Z",
+              "windowMinutes": 300
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "noUsageData": []
+}
+```
+
+Every model in one pool shares the windows of that pool. `kind` is `session`
+(a 5 hour or rolling window), `weekly`, `monthly`, or `other`. A provider with
+`available: false` gives the cause in `reason`. The report never holds account
+emails or API keys.
+
+T3 reports the limits for Codex and Claude Code. For an enabled T3 instance
+that has no T3 usage data, the server runs a probe:
+
+| T3 driver | Probe | Configuration |
+|---|---|---|
+| `antigravity` | `agy --print /usage --output-format json` (read-only) | `T3_USAGE_ANTIGRAVITY_CLI`, default `agy`. Set `off` to disable. |
+| `opencode` | `GET https://opencode.ai/zen/go/v1/usage` (read-only) | `OPENCODE_GO_API_KEY_FILE` or `OPENCODE_GO_API_KEY`. With no key, the probe does not run. |
+
+The Antigravity probe uses the Antigravity authentication of the user that
+runs the server. The OpenCode Go probe reads the key file on each call, so a
+rotated key takes effect with no restart. It sends the key only in the
+`Authorization` header, and it never copies the response body of a failed
+request into the report.
+
+Other probe variables:
+
+- `T3_USAGE_PROBE_TIMEOUT_MS` — timeout for each probe, default `20000`
+- `OPENCODE_GO_USAGE_URL` — usage endpoint, default `https://opencode.ai/zen/go/v1/usage`
+
+The OpenCode Go quota covers only the `opencode-go/*` models. Other providers
+in the same OpenCode instance, for example API-billed providers, have no quota
+in this report.
 
 ## Authentication
 
@@ -100,6 +182,7 @@ MCP_HTTP_PATH=/mcp \
 T3_CODE_URL=http://127.0.0.1:8731 \
 T3_CODE_BASE_DIR=/var/lib/t3code \
 T3_CODE_CLI=/path/to/t3 \
+OPENCODE_GO_API_KEY_FILE=/run/secrets/opencode-zen-api-key \
 t3code-mcp
 ```
 
@@ -132,6 +215,10 @@ Example NixOS usage when the repository is available as a source path:
     t3Command = "/path/to/t3";
     after = [ "t3code.service" ];
     requires = [ "t3code.service" ];
+
+    # Optional usage probes for t3_get_usage_limits.
+    opencodeGoApiKeyFile = "/run/secrets/opencode-zen-api-key";  # passed with LoadCredential
+    antigravityCommand = null;  # the service user needs its own agy login
   };
 }
 ```

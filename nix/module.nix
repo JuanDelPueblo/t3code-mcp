@@ -85,6 +85,31 @@ in
       description = "Label attached to locally minted T3 pairing credentials.";
     };
 
+    antigravityCommand = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "/run/current-system/sw/bin/agy";
+      description = ''
+        Antigravity CLI for the usage probe of t3_get_usage_limits. The probe
+        runs `agy --print /usage --output-format json` as the service user, so
+        that user needs its own Antigravity authentication state. ProtectHome
+        hides /home, so a user with its home under /home cannot use the probe.
+        Null disables the probe.
+      '';
+    };
+
+    opencodeGoApiKeyFile = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "/run/secrets/opencode-zen-api-key";
+      description = ''
+        File with the OpenCode Go API key for the usage probe of
+        t3_get_usage_limits. systemd passes it to the service with
+        LoadCredential, so the service user does not need read access to the
+        file. Null disables the probe.
+      '';
+    };
+
     after = lib.mkOption {
       type = lib.types.listOf lib.types.str;
       default = [ ];
@@ -146,12 +171,16 @@ in
         T3_CODE_CLI = cfg.t3Command;
         T3_CODE_PAIRING_TTL = cfg.pairingTtl;
         T3_CODE_PAIRING_LABEL = cfg.pairingLabel;
+        T3_USAGE_ANTIGRAVITY_CLI = if cfg.antigravityCommand == null then "off" else cfg.antigravityCommand;
       } // cfg.extraEnvironment;
 
       serviceConfig = {
         User = cfg.user;
         Group = cfg.group;
         ExecStart = lib.getExe cfg.package;
+        # usage.ts reads $CREDENTIALS_DIRECTORY/opencode-go-api-key.
+        LoadCredential = lib.optional (cfg.opencodeGoApiKeyFile != null)
+          "opencode-go-api-key:${cfg.opencodeGoApiKeyFile}";
         Restart = "on-failure";
         RestartSec = 5;
 

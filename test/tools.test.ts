@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  followUpTurnCommand,
   formatThreadDetail,
   formatThreadRows,
   formatUsageLimits,
@@ -190,6 +191,13 @@ describe("formatThreadDetail", () => {
     expect(output).toContain("of 2");
   });
 
+  it("shows no items when a limit is 0", () => {
+    const output = formatThreadDetail(snapshot, 0, 0);
+    expect(output).toContain("Last messages (0 of");
+    expect(output).toContain("Recent activities (0 of");
+    expect(output).not.toMatch(/\n  \[/);
+  });
+
   it("handles threads with no turn or session", () => {
     const output = formatThreadDetail({
       snapshotSequence: 5,
@@ -274,6 +282,27 @@ describe("formatUsageLimits", () => {
     const output = formatUsageLimits(config, nowMs);
     expect(output).toContain("No usage data: OpenCode");
     expect(formatUsageLimits({}, nowMs)).toBe("(no usage limits reported)");
+  });
+});
+
+describe("followUpTurnCommand", () => {
+  it("uses the thread's modes and omits modelSelection so the thread keeps its model", () => {
+    const command = followUpTurnCommand(
+      thread({ id: "thread-9", runtimeMode: "auto-accept-edits", interactionMode: "plan" }),
+      "Fix the review findings",
+      { commandId: "cmd-1", messageId: "msg-1", createdAt: "2026-09-25T23:30:00.000Z" },
+    );
+    expect(command).toEqual({
+      type: "thread.turn.start",
+      commandId: "cmd-1",
+      threadId: "thread-9",
+      message: { messageId: "msg-1", role: "user", text: "Fix the review findings", attachments: [] },
+      runtimeMode: "auto-accept-edits",
+      interactionMode: "plan",
+      createdAt: "2026-09-25T23:30:00.000Z",
+    });
+    expect(command).not.toHaveProperty("modelSelection");
+    expect(command).not.toHaveProperty("bootstrap");
   });
 });
 

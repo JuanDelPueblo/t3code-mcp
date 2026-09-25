@@ -6,10 +6,12 @@ import { accessTokenProviderFromEnvironment } from "./auth.js";
 import { serveStreamableHttp } from "./http.js";
 import { T3Client } from "./t3client.js";
 import { registerTools } from "./tools.js";
+import { usageProbeOptionsFromEnvironment } from "./usage.js";
 
 const baseUrl = process.env.T3_CODE_URL ?? "http://127.0.0.1:3000";
 const accessTokenProvider = await accessTokenProviderFromEnvironment(baseUrl);
 const client = new T3Client({ baseUrl, accessTokenProvider });
+const usageOptions = usageProbeOptionsFromEnvironment();
 
 function createMcpServer(): McpServer {
   const server = new McpServer(
@@ -32,12 +34,16 @@ function createMcpServer(): McpServer {
         "   reuse one.",
         "4. Inspect current state with t3_get_thread or t3_get_status; both return",
         "   an immediate snapshot and work for threads from any client.",
-        "5. Use t3_interrupt or t3_stop_session for lifecycle control.",
+        "5. Call t3_send_message to continue a settled thread in its own session,",
+        "   for example to send review findings back to the agent that did the work.",
+        "6. Call t3_get_usage_limits before assigning work. Its structuredContent",
+        "   gives used and remaining percent per quota window and per model pool.",
+        "7. Use t3_interrupt or t3_stop_session for lifecycle control.",
       ].join("\n"),
     },
   );
 
-  registerTools(server, client);
+  registerTools(server, client, usageOptions);
   return server;
 }
 
