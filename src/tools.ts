@@ -669,6 +669,78 @@ export function registerTools(server: McpServer, client: T3Client): void {
   );
 
   server.tool(
+    "t3_send_message",
+    "Start another turn on an existing T3 Code thread. Unlike t3_send_prompt " +
+      "(which creates a new thread), t3_send_message reuses the supplied threadId " +
+      "and preserves its model selection, runtime mode, interaction mode, branch, " +
+      "and worktree. Use it to wake/reuse a worker thread or to wake an idle " +
+      "orchestrator thread. waitMs=0 dispatches and returns immediately.",
+    {
+      threadId: z.string().min(1).describe("Existing T3 Code thread ID (from t3_list_threads or t3_send_prompt)"),
+      prompt: z.string().min(1).describe("User message to send as a new turn on the existing thread"),
+      waitMs: z
+        .number()
+        .int()
+        .min(0)
+        .max(120_000)
+        .optional()
+        .describe("Milliseconds to collect response events before returning. Default 0 (return immediately)."),
+    },
+    async ({ threadId, prompt, waitMs }) => {
+      try {
+        // Read the existing thread first: validates the ID (unknown IDs fail
+        // here with a useful error) and obtains the model/runtime settings
+        // required by thread.turn.start.
+        const snapshot = await client.getThreadSnapshot(threadId);
+        const thread = snapshot.thread;
+
+        // Reuse the thread's own configuration; never create a project,
+        // thread, branch, or worktree here (no bootstrap payload).
+        await client.dispatchCommand({
+          type: "thread.turn.start",
+          commandId: commandId(),
+          threadId,
+          message: {
+            messageId: randomUUID(),
+            role: "user",
+            text: prompt,
+            attachments: [],
+          },
+          ...(thread.modelSelection ? { modelSelection: thread.modelSelection } : {}),
+          ...(thread.runtimeMode ? { runtimeMode: thread.runtimeMode } : {}),
+          ...(thread.interactionMode ? { interactionMode: thread.interactionMode } : {}),
+          createdAt: now(),
+        });
+
+        const wait = waitMs ?? 0;
+        const header = [
+          `Turn dispatched on thread: ${threadId}`,
+          `Model: ${JSON.stringify(thread.modelSelection ?? null)}`,
+          `Runtime: ${thread.runtimeMode ?? "n/a"} Interaction: ${thread.interactionMode ?? "n/a"}`,
+          ...(thread.branch ? [`Branch: ${thread.branch}`] : []),
+          ...(thread.worktreePath ? [`Worktree: ${thread.worktreePath}`] : []),
+        ].join("\n");
+
+        if (wait === 0) {
+          return textResult(header);
+        }
+
+        const events = await collectThreadEvents(
+          client,
+          threadId,
+          wait,
+          snapshot.snapshotSequence,
+        );
+        return textResult(
+          [header, "", "Response events:", formatThreadEvents(events)].join("\n"),
+        );
+      } catch (error) {
+        return errorResult(error);
+      }
+    },
+  );
+
+  server.tool(
     "t3_get_status",
     "Get the current state of a T3 Code thread: an immediate snapshot plus, " +
       "optionally, live events collected for waitMs milliseconds.",

@@ -46,10 +46,17 @@ export interface T3Message {
   createdAt: string;
 }
 
+export interface T3ModelSelection {
+  instanceId?: string;
+  model?: unknown;
+  options?: unknown;
+}
+
 export interface T3Thread {
   id: string;
   projectId: string;
   title: string;
+  modelSelection?: T3ModelSelection | null;
   runtimeMode: string;
   interactionMode: string;
   branch: string | null;

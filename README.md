@@ -12,6 +12,7 @@ T3 v0.0.42 and supports both local stdio clients and a long-running Streamable H
 - `t3_list_threads` — discover existing threads with their current state, including threads started from the T3 UI or another client
 - `t3_get_thread` — immediate current snapshot of one thread: state, latest turn, messages, activities
 - `t3_send_prompt` — create a project/thread and start a coding turn
+- `t3_send_message` — start another turn on an existing thread
 - `t3_get_status` — immediate thread snapshot plus optional live event tail
 - `t3_interrupt` — interrupt a running turn
 - `t3_stop_session` — stop a provider session
@@ -53,6 +54,26 @@ repository and reports the claimed path in the result. Optional refinements:
 worktree, so a later prompt can reuse the reported `worktreePath`. T3 leaves
 created worktrees on disk after the thread settles. Remove them with
 `git worktree remove` when done.
+
+## Sending a message to an existing thread
+
+`t3_send_prompt` creates a new thread. `t3_send_message` starts another turn
+on an existing thread. It sends `prompt` as a new user message with
+`thread.turn.start`, reuses the thread's model selection, runtime mode,
+interaction mode, branch, and worktree, and never creates a project, thread,
+branch, or worktree. `waitMs=0` dispatches and returns immediately;
+`waitMs>0` also collects response events in the same format used elsewhere.
+
+Intended usage:
+
+```text
+t3_send_prompt → create worker thread
+worker settles
+t3_send_message(workerThreadId, "...") → wake/reuse worker
+
+t3_send_message(orchestratorThreadId, "WORKER_DONE ...")
+→ wake an existing orchestrator thread
+```
 
 ## Authentication
 
