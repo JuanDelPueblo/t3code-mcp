@@ -864,6 +864,7 @@ export function registerTools(
         "Send a follow-up message to an existing T3 Code thread and start a new turn " +
         "in the same provider session, so the agent keeps its context. The turn " +
         "uses the model, runtime mode, interaction mode, and worktree of the thread. " +
+        "Use it to wake or reuse a worker thread, or to wake an idle orchestrator thread. " +
         "Fails when a turn is still running; wait, or call t3_interrupt first. " +
         "structuredContent gives the turn state after waitMs.",
       outputSchema: turnStartedOutputSchema,

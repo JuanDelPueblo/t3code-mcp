@@ -12,7 +12,7 @@ T3 v0.0.42 and supports both local stdio clients and a long-running Streamable H
 - `t3_list_threads` — discover existing threads with their current state, including threads started from the T3 UI or another client
 - `t3_get_thread` — immediate current snapshot of one thread: state, latest turn, messages, activities
 - `t3_send_prompt` — create a project/thread and start a coding turn
-- `t3_send_message` — start a follow-up turn in an existing thread, in the same provider session
+- `t3_send_message` — start another turn on an existing thread, in the same provider session
 - `t3_get_status` — immediate thread snapshot plus optional live event tail
 - `t3_interrupt` — interrupt a running turn
 - `t3_stop_session` — stop a provider session
@@ -57,13 +57,29 @@ created worktrees on disk after the thread settles. Remove them with
 
 ## Follow-up messages
 
-`t3_send_message` sends a new message to an existing thread. The agent
+`t3_send_message` starts another turn on an existing thread. The agent
 continues in the same provider session, so it keeps its context, and the turn
 uses the model, runtime mode, interaction mode, and worktree of the thread.
-Use it to send review findings back to the agent that did the work.
+It never creates a new project, thread, branch, or worktree. Use it to wake
+or reuse a worker thread, to wake an idle orchestrator thread, or to send
+review findings back to the agent that did the work.
 
 The tool refuses a thread with a running turn. Wait for the turn to settle, or
 call `t3_interrupt` first.
+
+`waitMs` sets how long the call collects response events before it returns;
+default 30000. `structuredContent` gives the turn state after that wait.
+
+Intended usage:
+
+```text
+t3_send_prompt → create worker thread
+worker settles
+t3_send_message(workerThreadId, "...") → wake/reuse worker
+
+t3_send_message(orchestratorThreadId, "WORKER_DONE ...")
+→ wake an existing orchestrator thread
+```
 
 ## Usage limits
 
