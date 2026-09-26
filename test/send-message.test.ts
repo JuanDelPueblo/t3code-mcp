@@ -242,3 +242,72 @@ describe("t3_send_message", () => {
     expect(result.content[0].text).toMatch(/404|not found/i);
   });
 });
+
+describe("thread names", () => {
+  it("uses an explicit name for a new thread", async () => {
+    const { client, dispatched } = fakeClient();
+    const tools = captureTools(client);
+    await tools.get("t3_send_prompt")!({
+      projectId: "project-1",
+      instanceId: "codex",
+      model: "gpt-6-sol",
+      prompt: "Read the orchestrator skill and act.",
+      title: "OEM Unlock Orchestrator",
+      waitMs: 0,
+    });
+
+    const created = dispatched.find((item) =>
+      (item as Record<string, unknown>).type === "thread.create",
+    ) as Record<string, unknown>;
+    expect(created.title).toBe("OEM Unlock Orchestrator");
+  });
+
+  it("uses an explicit name for a new worktree thread", async () => {
+    const { client, dispatched } = fakeClient({
+      getReadModel: vi.fn(async () => ({
+        projects: [{ id: "project-1", workspaceRoot: "/srv/work" }],
+      })),
+    });
+    const tools = captureTools(client);
+    await tools.get("t3_send_prompt")!({
+      projectId: "project-1",
+      instanceId: "codex",
+      model: "gpt-6-sol",
+      prompt: "Complete the task.",
+      title: "Worker: BIT6 eligibility owner",
+      baseBranch: "main",
+      branch: "agent/bit6-eligibility-owner",
+      waitMs: 0,
+    });
+
+    const started = dispatched.find((item) =>
+      (item as Record<string, unknown>).type === "thread.turn.start",
+    ) as Record<string, unknown>;
+    const bootstrap = started.bootstrap as Record<string, unknown>;
+    expect(bootstrap.createThread).toMatchObject({
+      title: "Worker: BIT6 eligibility owner",
+    });
+  });
+
+  it("renames an existing thread through T3 metadata", async () => {
+    const { client, dispatched } = fakeClient();
+    const tools = captureTools(client);
+    const result = await tools.get("t3_rename_thread")!({
+      threadId: "thread-existing",
+      title: "BIT6 Path Review",
+    });
+
+    expect(dispatched).toHaveLength(1);
+    expect(dispatched[0]).toMatchObject({
+      type: "thread.meta.update",
+      threadId: "thread-existing",
+      title: "BIT6 Path Review",
+    });
+    expect(result.structuredContent).toMatchObject({
+      threadId: "thread-existing",
+      title: "BIT6 Path Review",
+      previousTitle: "Worker",
+      sequence: 123,
+    });
+  });
+});

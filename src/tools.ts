@@ -395,6 +395,13 @@ export const turnStartedOutputSchema = {
   lastAssistantMessage: z.string().nullable(),
 };
 
+export const threadRenamedOutputSchema = {
+  threadId: z.string(),
+  title: z.string(),
+  previousTitle: z.string(),
+  sequence: z.number(),
+};
+
 const usageWindowSchema = z.object({
   id: z.string(),
   kind: z.enum(["session", "weekly", "monthly", "other"]),
@@ -585,6 +592,37 @@ export function registerTools(
   );
 
   server.registerTool(
+    "t3_rename_thread",
+    {
+      description:
+        "Set the name of an existing T3 Code thread. The change appears in " +
+        "thread lists and snapshots. Use t3_list_threads to find the thread ID.",
+      outputSchema: threadRenamedOutputSchema,
+      inputSchema: {
+        threadId: z.string().min(1).describe("Thread ID from t3_list_threads or t3_send_prompt"),
+        title: z.string().trim().min(1).describe("New thread name"),
+      },
+    },
+    async ({ threadId, title }) => {
+      try {
+        const before = await client.getThreadSnapshot(threadId);
+        const result = await client.dispatchCommand({
+          type: "thread.meta.update",
+          commandId: commandId(),
+          threadId,
+          title,
+        });
+        return structuredResult(
+          `Renamed thread ${threadId}: ${title}`,
+          { threadId, title, previousTitle: before.thread.title, sequence: result.sequence },
+        );
+      } catch (error) {
+        return errorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
     "t3_send_prompt",
     {
       description:
@@ -593,10 +631,12 @@ export function registerTools(
         "option IDs (capabilities.optionDescriptors) for modelOptions. Pass baseBranch " +
         "to create an isolated git worktree, or worktreePath to reuse one; " +
         "t3_list_threads and t3_get_thread report each thread's branch and worktree. " +
-        "structuredContent gives the thread ID, worktree path, and turn state.",
+        "Pass title to name the thread. structuredContent gives the thread ID, " +
+        "worktree path, and turn state.",
       outputSchema: turnStartedOutputSchema,
       inputSchema: {
       prompt: z.string().min(1).describe("Coding task or question to send to T3 Code"),
+      title: z.string().trim().min(1).optional().describe("Thread name. Defaults to the first 80 prompt characters."),
       projectId: z
         .string()
         .min(1)
@@ -678,6 +718,7 @@ export function registerTools(
     },
     async ({
       prompt,
+      title,
       projectId,
       workspaceRoot,
       instanceId,
@@ -744,7 +785,7 @@ export function registerTools(
         }
 
         const threadId = randomUUID();
-        const title = prompt.slice(0, 80);
+        const threadTitle = title ?? prompt.slice(0, 80);
         const threadBranch = branch ?? null;
         let worktreeSummary: string;
 
@@ -771,7 +812,7 @@ export function registerTools(
             bootstrap: {
               createThread: {
                 projectId: resolvedProjectId,
-                title,
+                title: threadTitle,
                 modelSelection,
                 runtimeMode: resolvedRuntimeMode,
                 interactionMode: resolvedInteractionMode,
@@ -801,7 +842,7 @@ export function registerTools(
             commandId: commandId(),
             threadId,
             projectId: resolvedProjectId,
-            title,
+            title: threadTitle,
             modelSelection,
             runtimeMode: resolvedRuntimeMode,
             interactionMode: resolvedInteractionMode,

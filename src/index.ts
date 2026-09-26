@@ -29,6 +29,7 @@ function createMcpServer(): McpServer {
         "2. Call t3_list_threads to discover existing threads, including threads",
         "   started from the T3 UI or another client.",
         "3. Call t3_send_prompt with an instanceId, model, and project/workspace.",
+        "   Pass title to give the new thread a clear name.",
         "   Pass modelOptions for reasoning/effort choices from t3_get_config,",
         "   baseBranch to create an isolated git worktree, or worktreePath to",
         "   reuse one.",
@@ -40,6 +41,7 @@ function createMcpServer(): McpServer {
         "6. Call t3_get_usage_limits before assigning work. Its structuredContent",
         "   gives used and remaining percent per quota window and per model pool.",
         "7. Use t3_interrupt or t3_stop_session for lifecycle control.",
+        "8. Use t3_rename_thread to name an existing thread.",
       ].join("\n"),
     },
   );

@@ -28,6 +28,10 @@ new events. `t3_send_prompt` uses T3's native `instanceId + model` model selecti
 `t3_send_prompt` creates a project/thread and starts a coding turn. It accepts
 two option groups beyond the prompt, model, and project.
 
+Pass `title` to give a new thread a name. Without `title`, the tool uses the
+first 80 characters of the prompt. Use `t3_rename_thread` with a thread ID and
+`title` to change the name of an existing thread.
+
 Model options: pass `modelOptions` as an object keyed by option ID. Read the
 valid IDs and values from the model's `capabilities.optionDescriptors` in
 `t3_get_config`. Common IDs are:
@@ -203,6 +207,69 @@ t3code-mcp
 ```
 
 The endpoint is then `http://127.0.0.1:8732/mcp`.
+
+### The start script
+
+`scripts/serve-http.sh` sets every variable above and starts the HTTP service:
+
+```bash
+./scripts/serve-http.sh            # start
+./scripts/serve-http.sh --check    # print the resolved settings, start nothing
+```
+
+The script keeps any value you export first, so each setting stays
+overridable:
+
+```bash
+MCP_HTTP_PORT=9000 ./scripts/serve-http.sh
+```
+
+It reads the T3 port from `~/.t3/userdata/server-runtime.json`. The T3 desktop
+application picks a new port at each start, so a fixed `T3_CODE_URL` fails
+after a restart. Set `T3_RUNTIME_FILE` to use a different runtime file.
+
+The script defaults to local pairing, and it finds the OpenCode Go API key in
+one of these files:
+
+- `~/.config/opencode/zen-api-key`
+- `~/.config/opencode/api-key`
+- `/run/secrets/opencode-zen-api-key`
+
+`--check` reports a warning and exit code 1 when T3 does not answer, or when
+the T3 CLI or the base directory is absent. It never prints a token or a key.
+
+## Harness configuration
+
+A T3 worker can call the HTTP bridge through a project script.
+A harness can also load this MCP server directly.
+Each harness keeps its own MCP configuration.
+
+| Harness | Transport | Where |
+| --- | --- | --- |
+| Claude Code | streamable HTTP | `.mcp.json` in the project |
+| Codex CLI | streamable HTTP | `~/.codex/config.toml`, `[mcp_servers.t3code]` |
+| OpenCode | streamable HTTP | `opencode.json` in the project, `mcp.t3code` |
+| Antigravity | stdio | `~/.gemini/config/mcp_config.json` |
+
+Antigravity supports stdio and SSE only. It cannot use streamable HTTP, so it
+runs `scripts/mcp-stdio.sh` instead of the shared HTTP service.
+
+Commands that write these entries:
+
+```bash
+codex mcp add t3code --url http://127.0.0.1:8732/mcp
+```
+
+Put the project files in Git. T3 runs a worker in a new worktree, and a
+worktree gets only the files that Git holds. A configuration outside Git
+leaves the worker with no way to send a message.
+
+Check each harness:
+
+```bash
+codex mcp get t3code
+opencode mcp list
+```
 
 ## Nix
 
