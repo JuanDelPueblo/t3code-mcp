@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
+import { z } from "zod";
 import {
   followUpTurnCommand,
+  listThreads,
+  threadDetail,
+  threadDetailOutputSchema,
+  threadListOutputSchema,
   formatThreadDetail,
   formatThreadRows,
   formatUsageLimits,
@@ -282,6 +287,60 @@ describe("formatUsageLimits", () => {
     const output = formatUsageLimits(config, nowMs);
     expect(output).toContain("No usage data: OpenCode");
     expect(formatUsageLimits({}, nowMs)).toBe("(no usage limits reported)");
+  });
+});
+
+describe("structured thread output", () => {
+  const long = "x".repeat(1500);
+  const snapshot: T3ThreadDetailSnapshot = {
+    snapshotSequence: 7,
+    thread: thread({
+      id: "thread-7",
+      branch: "agent/abl-delta",
+      worktreePath: "/home/u/.t3/worktrees/repo/agent-abl-delta",
+      modelSelection: { instanceId: "opencode", model: "opencode-go/muse-spark-1.3-contributor" },
+      latestTurn: {
+        turnId: "turn-7",
+        state: "completed",
+        requestedAt: "2026-09-21T11:00:00.000Z",
+        startedAt: "2026-09-21T11:00:01.000Z",
+        completedAt: "2026-09-21T11:09:00.000Z",
+        assistantMessageId: "m3",
+      },
+      settledAt: "2026-09-21T11:09:01.000Z",
+      messages: [
+        { id: "m1", role: "user", text: "Review it", createdAt: "2026-09-21T11:00:00.000Z" },
+        { id: "m2", role: "assistant", text: long, createdAt: "2026-09-21T11:08:00.000Z" },
+        { id: "m3", role: "assistant", text: "", createdAt: "2026-09-21T11:09:00.000Z" },
+      ],
+    }),
+  };
+
+  it("keeps the full text and skips empty assistant messages for lastAssistantMessage", () => {
+    const detail = threadDetail(snapshot, 2, 0);
+    expect(detail.lastAssistantMessage).toBe(long);
+    expect(detail.messages.map((m) => m.id)).toEqual(["m2", "m3"]);
+    expect(detail.messages[0].text).toHaveLength(1500);
+    expect(detail).toMatchObject({
+      instanceId: "opencode",
+      model: "opencode-go/muse-spark-1.3-contributor",
+      turnState: "completed",
+      turnId: "turn-7",
+      settled: true,
+      branch: "agent/abl-delta",
+      messageCount: 3,
+      activities: [],
+    });
+    expect(() => z.object(threadDetailOutputSchema).strict().parse(detail)).not.toThrow();
+  });
+
+  it("lists projects and thread summaries that match the output schema", () => {
+    const list = listThreads(readModel([thread({}), thread({ id: "thread-2", deletedAt: "2026-09-21T12:00:00.000Z" })]));
+    expect(list.projects).toEqual([{ id: "project-1", title: "Parser", workspaceRoot: "/srv/work/parser" }]);
+    expect(list.threads.map((t) => [t.id, t.projectTitle, t.workspaceRoot, t.turnState, t.instanceId])).toEqual([
+      ["thread-1", "Parser", "/srv/work/parser", "no-turns", null],
+    ]);
+    expect(() => z.object(threadListOutputSchema).strict().parse(list)).not.toThrow();
   });
 });
 

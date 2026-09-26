@@ -7,6 +7,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import {
   T3Client,
+  type T3Project,
   type T3ReadModel,
   type T3Thread,
   type T3ThreadDetailSnapshot,
@@ -77,16 +78,60 @@ async function collectThreadEvents(
   return events;
 }
 
-/** Format a read model into discovery rows for t3_list_threads. */
-export function formatThreadRows(
+/** Structured summary of one thread, shared by the list and detail tools. */
+export interface ThreadSummary {
+  id: string;
+  title: string;
+  projectId: string;
+  projectTitle: string | null;
+  workspaceRoot: string | null;
+  instanceId: string | null;
+  model: string | null;
+  runtimeMode: string;
+  interactionMode: string;
+  turnState: string;
+  turnId: string | null;
+  sessionStatus: string;
+  settled: boolean;
+  branch: string | null;
+  worktreePath: string | null;
+  updatedAt: string;
+}
+
+export function threadSummary(thread: T3Thread, project?: T3Project): ThreadSummary {
+  return {
+    id: thread.id,
+    title: thread.title,
+    projectId: thread.projectId,
+    projectTitle: project?.title ?? null,
+    workspaceRoot: project?.workspaceRoot ?? null,
+    instanceId: thread.modelSelection?.instanceId ?? null,
+    model: thread.modelSelection?.model ?? null,
+    runtimeMode: thread.runtimeMode,
+    interactionMode: thread.interactionMode,
+    turnState: thread.latestTurn?.state ?? "no-turns",
+    turnId: thread.latestTurn?.turnId ?? null,
+    sessionStatus: thread.session?.status ?? "no-session",
+    settled: thread.settledAt !== null || thread.settledOverride === "settled",
+    branch: thread.branch,
+    worktreePath: thread.worktreePath,
+    updatedAt: thread.updatedAt,
+  };
+}
+
+export interface ThreadList {
+  projects: Array<{ id: string; title: string; workspaceRoot: string }>;
+  threads: ThreadSummary[];
+}
+
+/** Select, sort, and summarize threads for t3_list_threads. */
+export function listThreads(
   readModel: T3ReadModel,
   options: { query?: string; limit?: number } = {},
-): string {
+): ThreadList {
   const limit = options.limit ?? 20;
   const query = options.query?.trim().toLowerCase();
-  const projectTitles = new Map(
-    readModel.projects.map((project) => [project.id, project]),
-  );
+  const projects = new Map(readModel.projects.map((project) => [project.id, project]));
 
   const threads = readModel.threads
     .filter((thread) => thread.deletedAt === null)
@@ -101,23 +146,34 @@ export function formatThreadRows(
     .sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : -1))
     .slice(0, limit);
 
+  return {
+    projects: readModel.projects.map(({ id, title, workspaceRoot }) => ({ id, title, workspaceRoot })),
+    threads: threads.map((thread) => threadSummary(thread, projects.get(thread.projectId))),
+  };
+}
+
+/** Format a read model into discovery rows for t3_list_threads. */
+export function formatThreadRows(
+  readModel: T3ReadModel,
+  options: { query?: string; limit?: number } = {},
+): string {
+  const { threads } = listThreads(readModel, options);
+
   if (threads.length === 0) {
-    return query ? "(no threads match the query)" : "(no threads exist)";
+    return options.query?.trim() ? "(no threads match the query)" : "(no threads exist)";
   }
 
   return threads
     .map((thread) => {
-      const turnState = thread.latestTurn?.state ?? "no-turns";
-      const settled = thread.settledAt !== null || thread.settledOverride === "settled";
-      const sessionStatus = thread.session?.status ?? "no-session";
-      const project = projectTitles.get(thread.projectId);
-      const projectLabel = project ? `${project.title} (${project.workspaceRoot})` : thread.projectId;
+      const projectLabel = thread.projectTitle
+        ? `${thread.projectTitle} (${thread.workspaceRoot})`
+        : thread.projectId;
       const placement = [
         ...(thread.branch ? [`branch=${thread.branch}`] : []),
         ...(thread.worktreePath ? [`worktree=${thread.worktreePath}`] : []),
       ].join(" ");
       return [
-        `${thread.title} — turn=${turnState} session=${sessionStatus}${settled ? " settled" : ""}`,
+        `${thread.title} — turn=${thread.turnState} session=${thread.sessionStatus}${thread.settled ? " settled" : ""}`,
         `  id: ${thread.id}`,
         `  project: ${projectLabel}`,
         ...(placement ? [`  ${placement}`] : []),
@@ -130,6 +186,56 @@ export function formatThreadRows(
 /** The last `limit` items. `slice(-0)` returns every item, so handle 0 apart. */
 function lastItems<T>(items: T[], limit: number): T[] {
   return limit > 0 ? items.slice(-limit) : [];
+}
+
+export interface ThreadDetail extends ThreadSummary {
+  snapshotSequence: number;
+  turnStartedAt: string | null;
+  turnCompletedAt: string | null;
+  lastError: string | null;
+  /** Full text of the last assistant message that has text, for callers that parse replies. */
+  lastAssistantMessage: string | null;
+  messageCount: number;
+  messages: Array<{ id: string; role: string; text: string; createdAt: string }>;
+  activityCount: number;
+  activities: Array<{ kind: string; tone: string; summary: string; createdAt: string }>;
+}
+
+/** Structured thread detail. Messages keep their full text. */
+export function threadDetail(
+  snapshot: T3ThreadDetailSnapshot,
+  messageLimit = 10,
+  activityLimit = 10,
+  project?: T3Project,
+): ThreadDetail {
+  const thread = snapshot.thread;
+  const messages = thread.messages ?? [];
+  const activities = thread.activities ?? [];
+  const lastAssistant = [...messages]
+    .reverse()
+    .find((message) => message.role === "assistant" && String(message.text ?? "").trim() !== "");
+  return {
+    ...threadSummary(thread, project),
+    snapshotSequence: snapshot.snapshotSequence,
+    turnStartedAt: thread.latestTurn?.startedAt ?? null,
+    turnCompletedAt: thread.latestTurn?.completedAt ?? null,
+    lastError: thread.session?.lastError ?? null,
+    lastAssistantMessage: lastAssistant ? String(lastAssistant.text) : null,
+    messageCount: messages.length,
+    messages: lastItems(messages, messageLimit).map((message) => ({
+      id: message.id,
+      role: message.role ?? "unknown",
+      text: String(message.text ?? ""),
+      createdAt: message.createdAt,
+    })),
+    activityCount: activities.length,
+    activities: lastItems(activities, activityLimit).map((activity) => ({
+      kind: activity.kind,
+      tone: activity.tone,
+      summary: activity.summary ?? "",
+      createdAt: activity.createdAt,
+    })),
+  };
 }
 
 /** Format an HTTP thread detail snapshot for t3_get_thread / t3_get_status. */
@@ -238,6 +344,57 @@ function formatThreadEvents(events: unknown[]): string {
   return parts.join("\n") || "(events captured but no readable content)";
 }
 
+const threadSummaryShape = {
+  id: z.string(),
+  title: z.string(),
+  projectId: z.string(),
+  projectTitle: z.string().nullable(),
+  workspaceRoot: z.string().nullable(),
+  instanceId: z.string().nullable(),
+  model: z.string().nullable(),
+  runtimeMode: z.string(),
+  interactionMode: z.string(),
+  turnState: z.string(),
+  turnId: z.string().nullable(),
+  sessionStatus: z.string(),
+  settled: z.boolean(),
+  branch: z.string().nullable(),
+  worktreePath: z.string().nullable(),
+  updatedAt: z.string(),
+};
+
+/** Output schema of t3_list_threads. Mirrors ThreadList. */
+export const threadListOutputSchema = {
+  projects: z.array(z.object({ id: z.string(), title: z.string(), workspaceRoot: z.string() })),
+  threads: z.array(z.object(threadSummaryShape)),
+};
+
+/** Output schema of t3_get_thread. Mirrors ThreadDetail. */
+export const threadDetailOutputSchema = {
+  ...threadSummaryShape,
+  snapshotSequence: z.number(),
+  turnStartedAt: z.string().nullable(),
+  turnCompletedAt: z.string().nullable(),
+  lastError: z.string().nullable(),
+  lastAssistantMessage: z.string().nullable(),
+  messageCount: z.number(),
+  messages: z.array(z.object({ id: z.string(), role: z.string(), text: z.string(), createdAt: z.string() })),
+  activityCount: z.number(),
+  activities: z.array(z.object({ kind: z.string(), tone: z.string(), summary: z.string(), createdAt: z.string() })),
+};
+
+/** Output schema of t3_send_prompt and t3_send_message. */
+export const turnStartedOutputSchema = {
+  threadId: z.string(),
+  projectId: z.string(),
+  branch: z.string().nullable(),
+  worktreePath: z.string().nullable(),
+  turnState: z.string(),
+  sessionStatus: z.string(),
+  settled: z.boolean(),
+  lastAssistantMessage: z.string().nullable(),
+};
+
 const usageWindowSchema = z.object({
   id: z.string(),
   kind: z.enum(["session", "weekly", "monthly", "other"]),
@@ -324,16 +481,42 @@ function textResult(text: string) {
   };
 }
 
+function structuredResult<T extends object>(text: string, data: T) {
+  return {
+    content: [{ type: "text" as const, text }],
+    structuredContent: data as unknown as Record<string, unknown>,
+  };
+}
+
+/** Structured state after a turn start, for t3_send_prompt and t3_send_message. */
+function turnStarted(threadId: string, projectId: string, snapshot: T3ThreadDetailSnapshot | null) {
+  const detail = snapshot ? threadDetail(snapshot, 0, 0) : null;
+  return {
+    threadId,
+    projectId: detail?.projectId ?? projectId,
+    branch: detail?.branch ?? null,
+    worktreePath: detail?.worktreePath ?? null,
+    turnState: detail?.turnState ?? "unknown",
+    sessionStatus: detail?.sessionStatus ?? "unknown",
+    settled: detail?.settled ?? false,
+    lastAssistantMessage: detail?.lastAssistantMessage ?? null,
+  };
+}
+
 export function registerTools(
   server: McpServer,
   client: T3Client,
   usageOptions: UsageProbeOptions,
 ): void {
-  server.tool(
+  server.registerTool(
     "t3_list_threads",
-    "List existing T3 Code threads with their current state, including threads " +
-      "started from the T3 UI or any other client. Use t3_get_thread to inspect one.",
     {
+      description:
+        "List existing T3 Code threads with their current state, including threads " +
+        "started from the T3 UI or any other client. Use t3_get_thread to inspect one. " +
+        "structuredContent also lists every project with its ID and workspace root.",
+      outputSchema: threadListOutputSchema,
+      inputSchema: {
       query: z
         .string()
         .min(1)
@@ -346,23 +529,31 @@ export function registerTools(
         .max(50)
         .optional()
         .describe("Maximum number of threads to return. Default 20."),
+      },
     },
     async ({ query, limit }) => {
       try {
         const readModel = await client.getReadModel();
-        return textResult(formatThreadRows(readModel, { query, limit }));
+        return structuredResult(
+          formatThreadRows(readModel, { query, limit }),
+          listThreads(readModel, { query, limit }),
+        );
       } catch (error) {
         return errorResult(error);
       }
     },
   );
 
-  server.tool(
+  server.registerTool(
     "t3_get_thread",
-    "Get the current snapshot of an existing T3 Code thread: state, latest turn, " +
-      "recent messages and activities. Works for threads started from any client " +
-      "and returns immediately without waiting for new events.",
     {
+      description:
+        "Get the current snapshot of an existing T3 Code thread: state, latest turn, " +
+        "recent messages and activities. Works for threads started from any client " +
+        "and returns immediately without waiting for new events. structuredContent " +
+        "keeps the full message text and gives lastAssistantMessage.",
+      outputSchema: threadDetailOutputSchema,
+      inputSchema: {
       threadId: z.string().min(1).describe("T3 Code thread ID (from t3_list_threads or t3_send_prompt)"),
       messageLimit: z
         .number()
@@ -378,12 +569,14 @@ export function registerTools(
         .max(50)
         .optional()
         .describe("How many recent activities to include. Default 10."),
+      },
     },
     async ({ threadId, messageLimit, activityLimit }) => {
       try {
         const snapshot = await client.getThreadSnapshot(threadId);
-        return textResult(
+        return structuredResult(
           formatThreadDetail(snapshot, messageLimit ?? 10, activityLimit ?? 10),
+          threadDetail(snapshot, messageLimit ?? 10, activityLimit ?? 10),
         );
       } catch (error) {
         return errorResult(error);
@@ -391,14 +584,18 @@ export function registerTools(
     },
   );
 
-  server.tool(
+  server.registerTool(
     "t3_send_prompt",
-    "Create a T3 Code thread and send it a coding task. Call t3_get_config first " +
-      "to discover the configured provider instance IDs, model slugs, and model " +
-      "option IDs (capabilities.optionDescriptors) for modelOptions. Pass baseBranch " +
-      "to create an isolated git worktree, or worktreePath to reuse one; " +
-      "t3_list_threads and t3_get_thread report each thread's branch and worktree.",
     {
+      description:
+        "Create a T3 Code thread and send it a coding task. Call t3_get_config first " +
+        "to discover the configured provider instance IDs, model slugs, and model " +
+        "option IDs (capabilities.optionDescriptors) for modelOptions. Pass baseBranch " +
+        "to create an isolated git worktree, or worktreePath to reuse one; " +
+        "t3_list_threads and t3_get_thread report each thread's branch and worktree. " +
+        "structuredContent gives the thread ID, worktree path, and turn state.",
+      outputSchema: turnStartedOutputSchema,
+      inputSchema: {
       prompt: z.string().min(1).describe("Coding task or question to send to T3 Code"),
       projectId: z
         .string()
@@ -477,6 +674,7 @@ export function registerTools(
         .max(120_000)
         .optional()
         .describe("Milliseconds to collect response events before returning. Default 30000."),
+      },
     },
     async ({
       prompt,
@@ -632,16 +830,16 @@ export function registerTools(
         const events = await collectThreadEvents(client, threadId, waitMs ?? 30_000);
 
         // Report the server-claimed worktree path when T3 created one.
-        let createdWorktreePath: string | null = null;
+        let after: T3ThreadDetailSnapshot | null = null;
         try {
-          const snapshot = await client.getThreadSnapshot(threadId);
-          createdWorktreePath = snapshot.thread.worktreePath;
+          after = await client.getThreadSnapshot(threadId);
         } catch {
           // The events below already carry the response; a missing snapshot
           // must not fail the whole call.
         }
+        const createdWorktreePath = after?.thread.worktreePath ?? null;
 
-        return textResult(
+        return structuredResult(
           [
             `Thread created: ${threadId}`,
             `Project: ${resolvedProjectId}`,
@@ -651,6 +849,7 @@ export function registerTools(
             "Response events:",
             formatThreadEvents(events),
           ].join("\n"),
+          turnStarted(threadId, resolvedProjectId, after),
         );
       } catch (error) {
         return errorResult(error);
@@ -658,13 +857,17 @@ export function registerTools(
     },
   );
 
-  server.tool(
+  server.registerTool(
     "t3_send_message",
-    "Send a follow-up message to an existing T3 Code thread and start a new turn " +
-      "in the same provider session, so the agent keeps its context. The turn " +
-      "uses the model, runtime mode, interaction mode, and worktree of the thread. " +
-      "Fails when a turn is still running; wait, or call t3_interrupt first.",
     {
+      description:
+        "Send a follow-up message to an existing T3 Code thread and start a new turn " +
+        "in the same provider session, so the agent keeps its context. The turn " +
+        "uses the model, runtime mode, interaction mode, and worktree of the thread. " +
+        "Fails when a turn is still running; wait, or call t3_interrupt first. " +
+        "structuredContent gives the turn state after waitMs.",
+      outputSchema: turnStartedOutputSchema,
+      inputSchema: {
       threadId: z.string().min(1).describe("Thread ID from t3_send_prompt or t3_list_threads"),
       prompt: z.string().min(1).describe("Message to send to the agent of the thread"),
       waitMs: z
@@ -674,6 +877,7 @@ export function registerTools(
         .max(120_000)
         .optional()
         .describe("Milliseconds to collect response events before returning. Default 30000."),
+      },
     },
     async ({ threadId, prompt, waitMs }) => {
       try {
@@ -704,7 +908,14 @@ export function registerTools(
           snapshot.snapshotSequence,
         );
 
-        return textResult(
+        let after: T3ThreadDetailSnapshot | null = null;
+        try {
+          after = await client.getThreadSnapshot(threadId);
+        } catch {
+          // The events already carry the response; see t3_send_prompt.
+        }
+
+        return structuredResult(
           [
             `Message sent to thread ${threadId} (sequence ${result.sequence})`,
             ...(thread.worktreePath ? [`Worktree: ${thread.worktreePath}`] : []),
@@ -712,6 +923,7 @@ export function registerTools(
             "Response events:",
             formatThreadEvents(events),
           ].join("\n"),
+          turnStarted(threadId, thread.projectId, after ?? snapshot),
         );
       } catch (error) {
         return errorResult(error);

@@ -52,6 +52,7 @@ export interface T3Thread {
   title: string;
   runtimeMode: string;
   interactionMode: string;
+  modelSelection?: { instanceId: string; model: string } | null;
   branch: string | null;
   worktreePath: string | null;
   latestTurn: T3LatestTurn | null;

@@ -2,6 +2,8 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { z } from "zod";
+import { usageReportOutputSchema } from "../src/tools.js";
 import {
   collectUsageReport,
   formatUsageReport,
@@ -173,6 +175,7 @@ describe("collectUsageReport", () => {
       ["opencode-go", "opencode", "opencode-go-api", true],
     ]);
     expect(report.noUsageData).toEqual([]);
+    expect(() => z.object(usageReportOutputSchema).strict().parse(report)).not.toThrow();
     expect(seen).toEqual([{ url: "https://opencode.ai/zen/go/v1/usage", auth: "Bearer secret-key-value" }]);
 
     const json = JSON.stringify(report);
