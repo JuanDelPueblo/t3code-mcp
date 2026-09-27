@@ -1021,6 +1021,37 @@ export function registerTools(
     },
   );
 
+  server.tool(
+    "t3_settle_thread",
+    "Mark a T3 Code thread as settled, or pass settled=false to mark it active again. " +
+      "T3 refuses to settle while the session is starting or running, while an " +
+      "approval or user-input request is open, or while a turn start is queued; " +
+      "wait, or call t3_interrupt first.",
+    {
+      threadId: z.string().min(1).describe("Thread ID to settle or unsettle"),
+      settled: z
+        .boolean()
+        .optional()
+        .describe("true settles the thread, false unsettles it. Default true."),
+    },
+    async ({ threadId, settled }) => {
+      try {
+        const settle = settled ?? true;
+        const result = await client.dispatchCommand(
+          settle
+            ? { type: "thread.settle", commandId: commandId(), threadId }
+            : { type: "thread.unsettle", commandId: commandId(), threadId, reason: "user" },
+        );
+        return textResult(
+          `${settle ? "Settle" : "Unsettle"} dispatched for thread ${threadId}. ` +
+            `Sequence: ${result.sequence}`,
+        );
+      } catch (error) {
+        return errorResult(error);
+      }
+    },
+  );
+
   server.registerTool(
     "t3_get_usage_limits",
     {

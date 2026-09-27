@@ -16,6 +16,7 @@ T3 v0.0.42 and supports both local stdio clients and a long-running Streamable H
 - `t3_get_status` — immediate thread snapshot plus optional live event tail
 - `t3_interrupt` — interrupt a running turn
 - `t3_stop_session` — stop a provider session
+- `t3_settle_thread` — mark a thread settled, or active again with `settled: false`
 
 `t3_list_threads` and `t3_get_thread` use T3's supported HTTP orchestration API, so they
 work for threads created by any client and return the current state without waiting for

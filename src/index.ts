@@ -39,7 +39,8 @@ function createMcpServer(): McpServer {
         "   a worker thread or to send review findings back to the agent.",
         "6. Call t3_get_usage_limits before assigning work. Its structuredContent",
         "   gives used and remaining percent per quota window and per model pool.",
-        "7. Use t3_interrupt or t3_stop_session for lifecycle control.",
+        "7. Use t3_interrupt or t3_stop_session for lifecycle control, and",
+        "   t3_settle_thread to mark a thread settled or active again.",
       ].join("\n"),
     },
   );
