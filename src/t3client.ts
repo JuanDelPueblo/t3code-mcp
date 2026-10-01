@@ -1,5 +1,5 @@
 /**
- * T3 Code v0.0.42 orchestration client.
+ * T3 Code v0.0.44 orchestration client.
  *
  * The server uses Effect RPC JSON frames over WebSocket. Client requests use
  * `id`; server responses use `requestId`. Streaming chunks contain a batch
@@ -291,7 +291,8 @@ export class T3Client {
     }
   }
 
-  async connect(): Promise<void> {    if (this.ws?.readyState === WebSocket.OPEN) return;
+  async connect(): Promise<void> {
+    if (this.ws?.readyState === WebSocket.OPEN) return;
     if (this.connectPromise) return this.connectPromise;
 
     this.connectPromise = (async () => {

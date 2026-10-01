@@ -49,35 +49,13 @@ else
   export T3_CODE_PAIRING_LABEL="${T3_CODE_PAIRING_LABEL:-t3code-mcp}"
 fi
 
-# --- Usage probes for t3_get_usage_limits -----------------------------------
-# T3 reports Codex and Claude quota itself. Antigravity and OpenCode Go need
-# these two probes. The server still starts when a probe is absent, and
-# t3_get_usage_limits then omits that provider.
+# --- Optional Antigravity usage probe --------------------------------------
+# T3 v0.0.44 owns OpenCode Go credentials and usage. Only Antigravity needs
+# a fallback CLI probe when the server has no usage data.
 export T3_USAGE_ANTIGRAVITY_CLI="${T3_USAGE_ANTIGRAVITY_CLI:-$(command -v agy || echo agy)}"
-export OPENCODE_GO_USAGE_URL="${OPENCODE_GO_USAGE_URL:-https://opencode.ai/zen/go/v1/usage}"
-if [[ -z "${OPENCODE_GO_API_KEY:-}" && -z "${OPENCODE_GO_API_KEY_FILE:-}" ]]; then
-  # Test each path directly. /run/secrets is a symlink into a directory that
-  # does not list, so a shell glob misses a key that is readable.
-  for candidate in \
-    "$HOME/.config/opencode/zen-api-key" \
-    "$HOME/.config/opencode/api-key" \
-    "/run/secrets/opencode-zen-api-key"
-  do
-    if [[ -r "$candidate" ]]; then
-      export OPENCODE_GO_API_KEY_FILE="$candidate"
-      break
-    fi
-  done
-fi
 
 # --- Report the settings to stderr ------------------------------------------
 t3code_report() {
-  local opencode_state="absent (t3_get_usage_limits omits OpenCode Go)"
-  if [[ -n "${OPENCODE_GO_API_KEY:-}" ]]; then
-    opencode_state="set from OPENCODE_GO_API_KEY"
-  elif [[ -n "${OPENCODE_GO_API_KEY_FILE:-}" ]]; then
-    opencode_state="set from ${OPENCODE_GO_API_KEY_FILE}"
-  fi
   echo "t3code-mcp settings:" >&2
   t3note "T3_CODE_URL              $T3_CODE_URL"
   t3note "MCP_TRANSPORT            ${MCP_TRANSPORT:-stdio}"
@@ -87,7 +65,7 @@ t3code_report() {
   [[ -n "${T3_CODE_BASE_DIR:-}" ]] && t3note "T3_CODE_BASE_DIR         $T3_CODE_BASE_DIR"
   [[ -n "${T3_CODE_CLI:-}" ]] && t3note "T3_CODE_CLI              $T3_CODE_CLI"
   t3note "antigravity usage CLI    $T3_USAGE_ANTIGRAVITY_CLI"
-  t3note "opencode go API key      $opencode_state"
+  t3note "opencode go usage        provided by T3 Code"
   return 0
 }
 

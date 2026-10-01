@@ -9,14 +9,13 @@ type ToolHandler = (args: Record<string, unknown>) => Promise<{
 
 const usageOptions: UsageProbeOptions = {
   antigravityCli: null,
-  opencodeGoApiKey: null,
-  opencodeGoUsageUrl: "",
   timeoutMs: 1000,
 };
 
 function captureTools(client: unknown): Map<string, ToolHandler> {
   const tools = new Map<string, ToolHandler>();
   const fakeServer = {
+    server: { setRequestHandler: vi.fn() },
     tool: (name: string, ...rest: unknown[]) => {
       tools.set(name, rest[rest.length - 1] as ToolHandler);
     },
@@ -53,7 +52,7 @@ describe("t3_settle_thread", () => {
     expect(command.threadId).toBe("thread-1");
     expect(typeof command.commandId).toBe("string");
     expect(result.isError).toBeUndefined();
-    expect(result.content[0].text).toContain("Settle dispatched for thread thread-1");
+    expect(JSON.parse(result.content[0].text)).toEqual({ threadId: "thread-1", action: "thread.settle", sequence: 42 });
     expect(result.content[0].text).toContain("42");
   });
 
@@ -68,7 +67,7 @@ describe("t3_settle_thread", () => {
     expect(Object.keys(command).sort()).toEqual(["commandId", "reason", "threadId", "type"]);
     expect(command.type).toBe("thread.unsettle");
     expect(command.reason).toBe("user");
-    expect(result.content[0].text).toContain("Unsettle dispatched");
+    expect(JSON.parse(result.content[0].text)).toEqual({ threadId: "thread-1", action: "thread.unsettle", sequence: 42 });
   });
 
   it("returns the server's refusal as a tool error", async () => {

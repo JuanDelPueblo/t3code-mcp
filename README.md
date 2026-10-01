@@ -3,14 +3,15 @@
 MCP server for orchestrating [T3 Code](https://github.com/pingdotgg/t3code).
 
 This fork targets the current T3 Code authentication and orchestration protocol used by
-T3 v0.0.42 and supports both local stdio clients and a long-running Streamable HTTP service.
+T3 v0.0.44 and supports both local stdio clients and a long-running Streamable HTTP service.
 
 ## MCP tools
 
-- `t3_get_config` — inspect configured provider instances and model catalogs
-- `t3_get_usage_limits` — provider subscription usage: Codex/ChatGPT and Claude Code from T3, plus Antigravity and OpenCode Go from their own usage sources. Text plus `structuredContent`
+- `t3_get_config` — inspect configured provider instances and model catalogs under `config.providers`
+- `t3_get_usage_limits` — native T3 subscription usage, including OpenCode Go; optional Antigravity CLI fallback
 - `t3_list_threads` — discover existing threads with their current state, including threads started from the T3 UI or another client
 - `t3_get_thread` — immediate current snapshot of one thread: state, latest turn, messages, activities
+- `t3_rename_thread` — change an existing thread's title
 - `t3_send_prompt` — create a project/thread and start a coding turn
 - `t3_send_message` — start another turn on an existing thread, in the same provider session
 - `t3_get_status` — immediate thread snapshot plus optional live event tail
@@ -23,6 +24,45 @@ work for threads created by any client and return the current state without wait
 new events. `t3_send_prompt` uses T3's native `instanceId + model` model selection with
 `modelSelection.options` for reasoning/effort choices. Call
 `t3_get_config` first instead of assuming a provider or model name.
+
+## Structured output
+
+Every tool advertises an object `outputSchema` and returns its result in
+`structuredContent`. The single `content` text block is a JSON serialization
+of exactly that object, so clients receive the same fields on either path.
+Message and event text stays complete.
+
+| Tool | Success fields |
+| --- | --- |
+| `t3_get_config` | `config`, preserving the complete server configuration and model catalogs |
+| `t3_list_threads` | `projects`, `threads` |
+| `t3_get_thread` | Thread summary, snapshot sequence, messages, activities, `lastAssistantMessage` |
+| `t3_get_status` | Same detail fields as `t3_get_thread`, plus `events`, `waitMs` |
+| `t3_send_prompt`, `t3_send_message` | Thread/project IDs, placement, turn/session state, `sequence`, `events`, `snapshotAvailable`, `snapshotSequence` |
+| `t3_rename_thread` | `threadId`, `title`, `previousTitle`, `sequence` |
+| `t3_interrupt`, `t3_stop_session`, `t3_settle_thread` | `threadId`, `action` (T3 command type), `sequence` |
+| `t3_get_usage_limits` | `checkedAt`, normalized `providers`, `noUsageData` |
+
+Lifecycle results acknowledge command dispatch; read the thread again to confirm
+its state. Status snapshot fields describe the state before the optional event
+tail. Turn-start results describe the snapshot read after the wait. If that read
+fails, events and the dispatch sequence remain available, `snapshotAvailable`
+is false, `snapshotSequence` is null, and turn/session state is `unknown`.
+Compare `snapshotSequence` with the dispatch `sequence` to detect a snapshot
+that has not yet caught up to the accepted command.
+
+Every tool failure, including argument validation and unknown-tool errors,
+returns `isError: true` and this object in both output paths:
+
+```json
+{ "error": { "message": "Description of the failure" } }
+```
+
+Check `isError` before interpreting the success schema.
+
+Version 0.3.0 changes text-only responses to JSON, wraps the configuration in
+`config`, and adds structured fields to the previously text-only tools. Clients
+that parsed prose should switch to `structuredContent` or parse the JSON block.
 
 ## Sending prompts
 
@@ -88,8 +128,7 @@ t3_send_message(orchestratorThreadId, "WORKER_DONE ...")
 
 ## Usage limits
 
-`t3_get_usage_limits` returns readable text and the same data as
-`structuredContent`:
+`t3_get_usage_limits` returns this object as `structuredContent` and JSON text:
 
 ```json
 {
@@ -103,8 +142,10 @@ t3_send_message(orchestratorThreadId, "WORKER_DONE ...")
       "source": "antigravity-cli",
       "available": true,
       "reason": null,
+      "unavailableReason": null,
       "checkedAt": "2026-09-25T23:30:00.000Z",
       "resetCredits": null,
+      "externalUsage": null,
       "pools": [
         {
           "id": "gemini-models",
@@ -134,28 +175,34 @@ Every model in one pool shares the windows of that pool. `kind` is `session`
 `available: false` gives the cause in `reason`. The report never holds account
 emails or API keys.
 
-T3 reports the limits for Codex and Claude Code. For an enabled T3 instance
-that has no T3 usage data, the server runs a probe:
+T3 v0.0.44 provides OpenCode Go quota directly in each OpenCode instance's
+`usageLimits`. The MCP uses that snapshot with `source: "t3"`, preserving the
+`go_rolling`, `go_weekly`, and `go_monthly` window IDs, labels, durations, reset
+times, and checked time. `provider` identifies the driver; `instanceId`
+identifies the configured instance. Different instances remain separate.
 
-| T3 driver | Probe | Configuration |
-|---|---|---|
-| `antigravity` | `agy --print /usage --output-format json` (read-only) | `T3_USAGE_ANTIGRAVITY_CLI`, default `agy`. Set `off` to disable. |
-| `opencode` | `GET https://opencode.ai/zen/go/v1/usage` (read-only) | `OPENCODE_GO_API_KEY_FILE` or `OPENCODE_GO_API_KEY`. With no key, the probe does not run. |
+Native snapshots are authoritative, including empty windows, `unsupported`,
+and `probeFailed`. `unavailableReason` preserves the server's machine-readable
+reason; `reason` carries its message when present. Retained windows may appear
+with `available: false` after a failed probe. `externalUsage` preserves any
+provider dashboard link. Disabled instances are excluded. `noUsageData` lists
+enabled instances with no native snapshot and no configured fallback.
 
-The Antigravity probe uses the Antigravity authentication of the user that
-runs the server. The OpenCode Go probe reads the key file on each call, so a
-rotated key takes effect with no restart. It sends the key only in the
-`Authorization` header, and it never copies the response body of a failed
-request into the report.
+T3 reads OpenCode Go credentials in its own environment. Remote OpenCode
+servers report unsupported limits; the MCP does not read local credentials for
+them. The quota covers only `opencode-go/*` models, reflected in the pool's
+`models` field. See the [v0.0.44 implementation](https://github.com/pingdotgg/t3code/blob/v0.0.44/apps/server/src/provider/Layers/openCodeUsageLimits.ts).
 
-Other probe variables:
+Only Antigravity has a fallback probe: `agy --print /usage --output-format json`
+uses the authentication of the user running the MCP server, and runs only for an
+enabled Antigravity instance with no native usage snapshot. Configure
+`T3_USAGE_ANTIGRAVITY_CLI` (default `agy`, `off` disables) and
+`T3_USAGE_PROBE_TIMEOUT_MS` (default `20000`).
 
-- `T3_USAGE_PROBE_TIMEOUT_MS` — timeout for each probe, default `20000`
-- `OPENCODE_GO_USAGE_URL` — usage endpoint, default `https://opencode.ai/zen/go/v1/usage`
-
-The OpenCode Go quota covers only the `opencode-go/*` models. Other providers
-in the same OpenCode instance, for example API-billed providers, have no quota
-in this report.
+The MCP no longer reads `OPENCODE_GO_API_KEY`, `OPENCODE_GO_API_KEY_FILE`,
+`OPENCODE_GO_USAGE_URL`, or the `opencode-go-api-key` systemd credential. Remove
+these from bridge settings; configure credentials in T3's OpenCode environment.
+The Nix option `services.t3code-mcp.opencodeGoApiKeyFile` has been removed.
 
 ## Authentication
 
@@ -203,7 +250,6 @@ MCP_HTTP_PATH=/mcp \
 T3_CODE_URL=http://127.0.0.1:8731 \
 T3_CODE_BASE_DIR=/var/lib/t3code \
 T3_CODE_CLI=/path/to/t3 \
-OPENCODE_GO_API_KEY_FILE=/run/secrets/opencode-zen-api-key \
 t3code-mcp
 ```
 
@@ -229,12 +275,8 @@ It reads the T3 port from `~/.t3/userdata/server-runtime.json`. The T3 desktop
 application picks a new port at each start, so a fixed `T3_CODE_URL` fails
 after a restart. Set `T3_RUNTIME_FILE` to use a different runtime file.
 
-The script defaults to local pairing, and it finds the OpenCode Go API key in
-one of these files:
-
-- `~/.config/opencode/zen-api-key`
-- `~/.config/opencode/api-key`
-- `/run/secrets/opencode-zen-api-key`
+The script defaults to local pairing. OpenCode Go usage and authentication
+are managed by T3 Code.
 
 `--check` reports a warning and exit code 1 when T3 does not answer, or when
 the T3 CLI or the base directory is absent. It never prints a token or a key.
@@ -300,8 +342,7 @@ Example NixOS usage when the repository is available as a source path:
     after = [ "t3code.service" ];
     requires = [ "t3code.service" ];
 
-    # Optional usage probes for t3_get_usage_limits.
-    opencodeGoApiKeyFile = "/run/secrets/opencode-zen-api-key";  # passed with LoadCredential
+    # Optional Antigravity fallback for t3_get_usage_limits.
     antigravityCommand = null;  # the service user needs its own agy login
   };
 }
@@ -321,7 +362,7 @@ npm test
 
 ## Protocol notes
 
-T3 v0.0.42 uses:
+T3 v0.0.44 uses:
 
 - OAuth token exchange at `/oauth/token`
 - WebSocket tickets at `/api/auth/websocket-ticket`

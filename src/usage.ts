@@ -1,12 +1,9 @@
 /**
  * Provider usage limits for t3_get_usage_limits.
  *
- * T3 reports subscription limits for Codex and Claude Code in its server
- * config. It reports nothing for Antigravity or OpenCode Go, so two optional
- * probes fill the gap:
- *
- * - Antigravity: the read-only `agy --print /usage --output-format json`.
- * - OpenCode Go: the read-only `https://opencode.ai/zen/go/v1/usage` endpoint.
+ * T3 v0.0.44 reports subscription limits, including OpenCode Go, in its
+ * server config. An optional read-only Antigravity CLI probe fills the gap
+ * only when T3 has no native usage snapshot.
  *
  * Every source becomes one normalized UsageReport. The text output and the
  * structured output of the tool both come from that report. The report never
@@ -14,12 +11,9 @@
  */
 
 import { execFile } from "node:child_process";
-import { existsSync } from "node:fs";
-import { readFile } from "node:fs/promises";
-import { join } from "node:path";
 
 export type UsageWindowKind = "session" | "weekly" | "monthly" | "other";
-export type UsageSource = "t3" | "antigravity-cli" | "opencode-go-api";
+export type UsageSource = "t3" | "antigravity-cli";
 
 export interface UsageWindow {
   id: string;
@@ -47,8 +41,10 @@ export interface ProviderUsage {
   source: UsageSource;
   available: boolean;
   reason: string | null;
+  unavailableReason: string | null;
   checkedAt: string | null;
   resetCredits: number | null;
+  externalUsage: { label: string; url: string } | null;
   pools: UsagePool[];
 }
 
@@ -75,6 +71,7 @@ export interface T3UsageLimits {
   unavailable?: { reason?: string; message?: string } | null;
   windows?: T3UsageLimitWindow[];
   resetCredits?: { availableCount?: number } | null;
+  externalUsage?: { label: string; url: string };
 }
 
 export interface T3UsageLimitSource {
@@ -103,10 +100,6 @@ function isActive(provider: T3Provider): boolean {
   return provider.enabled !== false && provider.status !== "disabled";
 }
 
-function hasT3Windows(provider: T3Provider): boolean {
-  return (provider.usageLimits?.windows ?? []).some((win) => typeof win.usedPercent === "number");
-}
-
 function t3WindowLabel(win: T3UsageLimitWindow): string {
   if (win.label) return win.label;
   if (win.kind === "session") return "Session";
@@ -120,7 +113,7 @@ function fromT3Provider(provider: T3Provider): ProviderUsage {
   const limits = provider.usageLimits ?? {};
   const windows: UsageWindow[] = [];
   for (const win of limits.windows ?? []) {
-    if (typeof win.usedPercent !== "number") continue;
+    if (typeof win.usedPercent !== "number" || !Number.isFinite(win.usedPercent)) continue;
     const used = clampPercent(win.usedPercent);
     windows.push({
       id: win.id ?? win.kind ?? "window",
@@ -135,16 +128,24 @@ function fromT3Provider(provider: T3Provider): ProviderUsage {
 
   const credits = limits.resetCredits?.availableCount;
   return {
-    provider: provider.instanceId ?? "provider",
+    provider: provider.driver ?? provider.instanceId ?? "provider",
     instanceId: provider.instanceId ?? null,
     displayName: provider.displayName ?? provider.instanceId ?? "provider",
     plan: provider.auth?.label ?? null,
     source: "t3",
-    available: windows.length > 0,
-    reason: limits.unavailable?.message ?? null,
+    available: windows.length > 0 && !limits.unavailable,
+    reason: limits.unavailable?.message ?? limits.unavailable?.reason ??
+      (windows.length === 0 ? "No usage windows reported" : null),
+    unavailableReason: limits.unavailable?.reason ?? null,
     checkedAt: limits.checkedAt ?? null,
     resetCredits: typeof credits === "number" ? credits : null,
-    pools: windows.length > 0 ? [{ id: "default", name: null, models: null, windows }] : [],
+    externalUsage: limits.externalUsage ?? null,
+    pools: windows.length > 0 ? [{
+      id: "default", name: null,
+      models: provider.driver === "opencode" && windows.every((win) => win.id.startsWith("go_"))
+        ? "opencode-go/*" : null,
+      windows,
+    }] : [],
   };
 }
 
@@ -153,7 +154,7 @@ function unavailable(
   reason: string,
   checkedAt: string,
 ): ProviderUsage {
-  return { ...base, plan: null, available: false, reason, checkedAt, resetCredits: null, pools: [] };
+  return { ...base, plan: null, available: false, reason, unavailableReason: "probeFailed", checkedAt, resetCredits: null, externalUsage: null, pools: [] };
 }
 
 const ANTIGRAVITY_WINDOWS: Record<string, { kind: UsageWindowKind; label: string; minutes: number }> = {
@@ -225,110 +226,26 @@ export function parseAntigravityUsage(
     plan: null,
     available,
     reason: available ? null : "agy groups hold no usable buckets",
+    unavailableReason: available ? null : "probeFailed",
     checkedAt,
     resetCredits: null,
+    externalUsage: null,
     pools,
-  };
-}
-
-const OPENCODE_GO_WINDOWS: Record<string, { kind: UsageWindowKind; label: string; minutes: number | null }> = {
-  rolling: { kind: "session", label: "Rolling", minutes: null },
-  weekly: { kind: "weekly", label: "Weekly", minutes: 10080 },
-  monthly: { kind: "monthly", label: "Monthly", minutes: null },
-};
-
-/**
- * Parse the OpenCode Go usage response. `percent` is the used share of the
- * window, not the remaining share. A window with a status other than `ok`
- * makes the provider unavailable, because the numbers are not reliable.
- */
-export function parseOpencodeGoUsage(
-  raw: unknown,
-  instanceId: string | null,
-  checkedAt: string,
-): ProviderUsage {
-  const base = {
-    provider: "opencode-go",
-    instanceId,
-    displayName: "OpenCode Go",
-    source: "opencode-go-api" as const,
-  };
-  const usage = (raw as { usage?: unknown } | null)?.usage;
-  if (!usage || typeof usage !== "object") {
-    return unavailable(base, "response has no usage object", checkedAt);
-  }
-
-  const windows: UsageWindow[] = [];
-  const bad: string[] = [];
-  for (const [name, value] of Object.entries(usage as Record<string, unknown>)) {
-    const w = value as { status?: unknown; percent?: unknown; resetsAt?: unknown } | null;
-    if (!w || w.status !== "ok" || typeof w.percent !== "number") {
-      bad.push(`${name}=${String(w?.status ?? "malformed")}`);
-      continue;
-    }
-    const known = OPENCODE_GO_WINDOWS[name];
-    const used = clampPercent(w.percent);
-    windows.push({
-      id: name,
-      kind: known?.kind ?? "other",
-      label: known?.label ?? name,
-      usedPercent: round1(used),
-      remainingPercent: round1(100 - used),
-      resetsAt: typeof w.resetsAt === "string" ? w.resetsAt : null,
-      windowMinutes: known?.minutes ?? null,
-    });
-  }
-
-  if (bad.length > 0 || windows.length === 0) {
-    return unavailable(
-      base,
-      bad.length > 0 ? `window status not ok: ${bad.join(", ")}` : "response has no windows",
-      checkedAt,
-    );
-  }
-  return {
-    ...base,
-    plan: null,
-    available: true,
-    reason: null,
-    checkedAt,
-    resetCredits: null,
-    pools: [{ id: "opencode-go", name: null, models: "opencode-go/*", windows }],
   };
 }
 
 export interface UsageProbeOptions {
   /** Antigravity CLI command. `null` disables the probe. */
   antigravityCli: string | null;
-  /** Reads the OpenCode Go API key. `null` disables the probe. */
-  opencodeGoApiKey: (() => Promise<string>) | null;
-  opencodeGoUsageUrl: string;
   timeoutMs: number;
 }
 
-/** Read probe options from the environment. See README "Usage limits". */
+/** Read Antigravity probe options from the environment. */
 export function usageProbeOptionsFromEnvironment(env: NodeJS.ProcessEnv = process.env): UsageProbeOptions {
   const cli = env.T3_USAGE_ANTIGRAVITY_CLI ?? "agy";
   const timeout = Number.parseInt(env.T3_USAGE_PROBE_TIMEOUT_MS ?? "20000", 10);
-
-  let opencodeGoApiKey: UsageProbeOptions["opencodeGoApiKey"] = null;
-  const credentialFile = env.CREDENTIALS_DIRECTORY
-    ? join(env.CREDENTIALS_DIRECTORY, "opencode-go-api-key")
-    : null;
-  if (env.OPENCODE_GO_API_KEY) {
-    const key = env.OPENCODE_GO_API_KEY;
-    opencodeGoApiKey = async () => key;
-  } else if (env.OPENCODE_GO_API_KEY_FILE) {
-    const file = env.OPENCODE_GO_API_KEY_FILE;
-    opencodeGoApiKey = async () => (await readFile(file, "utf8")).trim();
-  } else if (credentialFile && existsSync(credentialFile)) {
-    opencodeGoApiKey = async () => (await readFile(credentialFile, "utf8")).trim();
-  }
-
   return {
     antigravityCli: cli === "" || cli === "off" ? null : cli,
-    opencodeGoApiKey,
-    opencodeGoUsageUrl: env.OPENCODE_GO_USAGE_URL ?? "https://opencode.ai/zen/go/v1/usage",
     timeoutMs: Number.isInteger(timeout) && timeout > 0 ? timeout : 20000,
   };
 }
@@ -382,89 +299,36 @@ export async function probeAntigravity(
   }
 }
 
-export async function probeOpencodeGo(
-  options: UsageProbeOptions,
-  instanceId: string | null,
-  fetchImpl: typeof fetch = fetch,
-): Promise<ProviderUsage> {
-  const checkedAt = new Date().toISOString();
-  const base = {
-    provider: "opencode-go",
-    instanceId,
-    displayName: "OpenCode Go",
-    source: "opencode-go-api" as const,
-  };
-  let key: string;
-  try {
-    key = await options.opencodeGoApiKey!();
-  } catch {
-    // The error text can hold the key file path only; still report no detail.
-    return unavailable(base, "API key is not readable", checkedAt);
-  }
-  if (!key) return unavailable(base, "API key is empty", checkedAt);
-
-  try {
-    const response = await fetchImpl(options.opencodeGoUsageUrl, {
-      headers: { Authorization: `Bearer ${key}` },
-      signal: AbortSignal.timeout(options.timeoutMs),
-    });
-    // Never copy the response body into the reason: keep the key and the
-    // account data out of error text.
-    if (!response.ok) return unavailable(base, `usage request failed (HTTP ${response.status})`, checkedAt);
-    return parseOpencodeGoUsage(await response.json(), instanceId, checkedAt);
-  } catch (error) {
-    const name = error instanceof Error ? error.name : "";
-    return unavailable(
-      base,
-      name === "TimeoutError" ? "usage request timed out" : "usage request failed",
-      checkedAt,
-    );
-  }
+/** A native usage snapshot is authoritative, including empty or unavailable limits. */
+function hasT3Usage(provider: T3Provider): boolean {
+  return provider.usageLimits != null;
 }
 
-/**
- * Build the report from the T3 config, then run the probes for the enabled
- * instances that T3 reports no windows for. T3 data wins when it exists.
- */
+/** Use T3's snapshots; only Antigravity may fall back to a local CLI probe. */
 export async function collectUsageReport(
   config: T3UsageLimitSource,
   options: UsageProbeOptions,
-  fetchImpl: typeof fetch = fetch,
 ): Promise<UsageReport> {
-  const providers = config.providers ?? [];
-  const fromT3 = providers.filter(hasT3Windows).map(fromT3Provider);
-  const missing = providers.filter((p) => isActive(p) && !hasT3Windows(p));
-
-  const probes: Array<Promise<ProviderUsage>> = [];
-  const probed = new Set<T3Provider>();
+  const report = usageReportFromConfig(config);
+  const missing = (config.providers ?? []).filter((p) => isActive(p) && !hasT3Usage(p));
   const antigravity = missing.find((p) => p.driver === "antigravity");
   if (antigravity && options.antigravityCli) {
-    probed.add(antigravity);
-    probes.push(probeAntigravity(options, antigravity.instanceId ?? null));
+    report.providers.push(await probeAntigravity(options, antigravity.instanceId ?? null));
+    report.noUsageData = missing
+      .filter((p) => p !== antigravity)
+      .map((p) => p.displayName ?? p.instanceId ?? "provider");
   }
-  const opencode = missing.find((p) => p.driver === "opencode");
-  if (opencode && options.opencodeGoApiKey) {
-    probed.add(opencode);
-    probes.push(probeOpencodeGo(options, opencode.instanceId ?? null, fetchImpl));
-  }
-
-  return {
-    checkedAt: new Date().toISOString(),
-    providers: [...fromT3, ...(await Promise.all(probes))],
-    noUsageData: missing
-      .filter((p) => !probed.has(p))
-      .map((p) => p.displayName ?? p.instanceId ?? "provider"),
-  };
+  return report;
 }
 
 /** Build a report from the T3 config only, with no probes. */
 export function usageReportFromConfig(config: T3UsageLimitSource, checkedAt = new Date().toISOString()): UsageReport {
-  const providers = config.providers ?? [];
+  const providers = (config.providers ?? []).filter(isActive);
   return {
     checkedAt,
-    providers: providers.filter(hasT3Windows).map(fromT3Provider),
+    providers: providers.filter(hasT3Usage).map(fromT3Provider),
     noUsageData: providers
-      .filter((p) => isActive(p) && !hasT3Windows(p))
+      .filter((p) => !hasT3Usage(p))
       .map((p) => p.displayName ?? p.instanceId ?? "provider"),
   };
 }

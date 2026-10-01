@@ -98,18 +98,6 @@ in
       '';
     };
 
-    opencodeGoApiKeyFile = lib.mkOption {
-      type = lib.types.nullOr lib.types.str;
-      default = null;
-      example = "/run/secrets/opencode-zen-api-key";
-      description = ''
-        File with the OpenCode Go API key for the usage probe of
-        t3_get_usage_limits. systemd passes it to the service with
-        LoadCredential, so the service user does not need read access to the
-        file. Null disables the probe.
-      '';
-    };
-
     after = lib.mkOption {
       type = lib.types.listOf lib.types.str;
       default = [ ];
@@ -178,9 +166,6 @@ in
         User = cfg.user;
         Group = cfg.group;
         ExecStart = lib.getExe cfg.package;
-        # usage.ts reads $CREDENTIALS_DIRECTORY/opencode-go-api-key.
-        LoadCredential = lib.optional (cfg.opencodeGoApiKeyFile != null)
-          "opencode-go-api-key:${cfg.opencodeGoApiKeyFile}";
         Restart = "on-failure";
         RestartSec = 5;
 

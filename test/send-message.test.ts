@@ -11,8 +11,6 @@ type ToolHandler = (args: Record<string, unknown>) => Promise<{
 
 const usageOptions: UsageProbeOptions = {
   antigravityCli: null,
-  opencodeGoApiKey: null,
-  opencodeGoUsageUrl: "",
   timeoutMs: 1000,
 };
 
@@ -51,6 +49,7 @@ function snapshotFixture(
 function captureTools(client: unknown): Map<string, ToolHandler> {
   const tools = new Map<string, ToolHandler>();
   const fakeServer = {
+    server: { setRequestHandler: vi.fn() },
     tool: (name: string, ...rest: unknown[]) => {
       tools.set(name, rest[rest.length - 1] as ToolHandler);
     },
@@ -129,7 +128,7 @@ describe("t3_send_message", () => {
     expect(types).not.toContain("thread.create");
     expect(types).not.toContain("project.create");
     expect(result.content[0].text).toContain("thread-existing");
-    expect(result.content[0].text.toLowerCase()).toContain("sent");
+    expect(result.structuredContent?.sequence).toBe(123);
   });
 
   it("reuses runtime/interaction mode and omits modelSelection so the thread keeps its own model", async () => {
@@ -182,10 +181,12 @@ describe("t3_send_message", () => {
     expect(subscribeCalls).toHaveLength(1);
     expect(subscribeCalls[0]).toMatchObject({ threadId: "thread-existing", afterSequence: 77 });
     const text = result.content[0].text;
-    expect(text).toContain("Response events:");
-    expect(text).toContain("[snapshot]");
-    expect(text).toContain("[message] role=assistant text=done");
-    expect(text).toContain("[event] thread.settled");
+    expect(JSON.parse(text)).toEqual(result.structuredContent);
+    expect(result.structuredContent?.events).toEqual([
+      { kind: "snapshot", snapshot: { thread: { session: { status: "ready" }, messages: [] } } },
+      { kind: "event", event: { type: "thread.message-sent", payload: { role: "assistant", text: "done" } } },
+      { kind: "event", event: { type: "thread.settled", payload: {} } },
+    ]);
   });
 
   it("refuses a thread with a running turn", async () => {

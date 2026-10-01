@@ -17,7 +17,7 @@ function createMcpServer(): McpServer {
   const server = new McpServer(
     {
       name: "t3code-mcp",
-      version: "0.2.0",
+      version: "0.3.0",
       description: "MCP server for orchestrating T3 Code",
     },
     {
@@ -25,7 +25,9 @@ function createMcpServer(): McpServer {
         "# T3 Code MCP",
         "",
         "Use T3 Code as a coding-agent orchestrator.",
-        "1. Call t3_get_config to discover provider instance IDs and models.",
+        "Every tool returns structuredContent with a matching JSON text block.",
+        "Errors have isError=true and structuredContent.error.message.",
+        "1. Call t3_get_config; its config.providers lists instance IDs and models.",
         "2. Call t3_list_threads to discover existing threads, including threads",
         "   started from the T3 UI or another client.",
         "3. Call t3_send_prompt with an instanceId, model, and project/workspace.",
@@ -40,6 +42,7 @@ function createMcpServer(): McpServer {
         "   a worker thread or to send review findings back to the agent.",
         "6. Call t3_get_usage_limits before assigning work. Its structuredContent",
         "   gives used and remaining percent per quota window and per model pool.",
+        "   OpenCode Go usage comes from T3 Code, without a separate MCP API key.",
         "7. Use t3_interrupt or t3_stop_session for lifecycle control, and",
         "   t3_settle_thread to mark a thread settled or active again.",
         "8. Use t3_rename_thread to name an existing thread.",

@@ -1,6 +1,6 @@
 {
   "name": "t3code-mcp",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "MCP server for controlling T3 Code via Model Context Protocol",
   "license": "MIT",
   "type": "module",
@@ -16,7 +16,7 @@
     "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json --noEmit"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.10.2",
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "ws": "^8.18.0",
     "zod": "^3.24.2"
   },

@@ -1,10 +1,11 @@
 /**
- * MCP tool implementations for T3 Code v0.0.42.
+ * MCP tool implementations for T3 Code v0.0.44.
  */
 
 import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import { CallToolRequestSchema, type CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import {
   T3Client,
   type T3Project,
@@ -30,7 +31,7 @@ function commandId(): string {
   return randomUUID();
 }
 
-/** Terminal event types in T3 v0.0.42's orchestration vocabulary. */
+/** Terminal event types in T3 v0.0.44's orchestration vocabulary. */
 export const terminalEventTypes: ReadonlySet<string> = new Set([
   "thread.settled",
   "thread.turn-diff-completed",
@@ -49,6 +50,7 @@ async function collectThreadEvents(
   timeoutMs: number,
   afterSequence?: number,
 ): Promise<unknown[]> {
+  if (timeoutMs === 0) return [];
   const events: unknown[] = [];
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -294,56 +296,6 @@ export function formatThreadDetail(
   return parts.join("\n");
 }
 
-function formatThreadEvents(events: unknown[]): string {
-  if (events.length === 0) return "(no events captured)";
-
-  const parts: string[] = [];
-
-  for (const item of events) {
-    if (!item || typeof item !== "object") continue;
-    const record = item as Record<string, unknown>;
-
-    if (record.kind === "synchronized") {
-      parts.push("[synchronized] caught up to live events");
-      continue;
-    }
-
-    if (record.kind === "snapshot") {
-      const snapshot = record.snapshot as Record<string, unknown> | null;
-      const thread = snapshot?.thread as Record<string, unknown> | null;
-      const session = thread?.session as Record<string, unknown> | null;
-      parts.push(`[snapshot] status=${session?.status ?? "idle"}`);
-
-      const messages = thread?.messages as unknown[] | null;
-      if (Array.isArray(messages)) {
-        for (const itemMessage of messages) {
-          const message = itemMessage as Record<string, unknown>;
-          parts.push(
-            `  [${message.role ?? "unknown"}] ${truncate(String(message.text ?? ""))}`,
-          );
-        }
-      }
-      continue;
-    }
-
-    if (record.kind !== "event") continue;
-
-    const event = record.event as Record<string, unknown> | undefined;
-    if (!event?.type) continue;
-
-    if (event.type === "thread.message-sent") {
-      const payload = event.payload as Record<string, unknown> | undefined;
-      parts.push(
-        `[message] role=${payload?.role ?? "unknown"} text=${truncate(String(payload?.text ?? ""))}`,
-      );
-    } else {
-      parts.push(`[event] ${String(event.type)}`);
-    }
-  }
-
-  return parts.join("\n") || "(events captured but no readable content)";
-}
-
 const threadSummaryShape = {
   id: z.string(),
   title: z.string(),
@@ -385,6 +337,10 @@ export const threadDetailOutputSchema = {
 
 /** Output schema of t3_send_prompt and t3_send_message. */
 export const turnStartedOutputSchema = {
+  sequence: z.number().int().nonnegative(),
+  events: z.array(z.unknown()),
+  snapshotAvailable: z.boolean(),
+  snapshotSequence: z.number().int().nonnegative().nullable(),
   threadId: z.string(),
   projectId: z.string(),
   branch: z.string().nullable(),
@@ -421,11 +377,13 @@ export const usageReportOutputSchema = {
       instanceId: z.string().nullable(),
       displayName: z.string(),
       plan: z.string().nullable(),
-      source: z.enum(["t3", "antigravity-cli", "opencode-go-api"]),
+      source: z.enum(["t3", "antigravity-cli"]),
       available: z.boolean(),
       reason: z.string().nullable(),
+      unavailableReason: z.string().nullable(),
       checkedAt: z.string().nullable(),
       resetCredits: z.number().nullable(),
+      externalUsage: z.object({ label: z.string(), url: z.string() }).nullable(),
       pools: z.array(
         z.object({
           id: z.string(),
@@ -470,35 +428,52 @@ export function followUpTurnCommand(
   };
 }
 
-function errorResult(error: unknown) {
+/** All text clients receive the same JSON object as structured clients. */
+function structuredResult<T extends object>(data: T): CallToolResult {
   return {
-    isError: true,
-    content: [
-      {
-        type: "text" as const,
-        text: `Error: ${error instanceof Error ? error.message : String(error)}`,
-      },
-    ],
-  };
-}
-
-function textResult(text: string) {
-  return {
-    content: [{ type: "text" as const, text }],
-  };
-}
-
-function structuredResult<T extends object>(text: string, data: T) {
-  return {
-    content: [{ type: "text" as const, text }],
+    content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
     structuredContent: data as unknown as Record<string, unknown>,
   };
 }
 
+function errorResult(error: unknown): CallToolResult {
+  return {
+    ...structuredResult({ error: { message: error instanceof Error ? error.message : String(error) } }),
+    isError: true,
+  };
+}
+
+export const threadStatusOutputSchema = {
+  ...threadDetailOutputSchema,
+  events: z.array(z.unknown()),
+  waitMs: z.number().int().nonnegative(),
+};
+
+/** Lifecycle results acknowledge dispatch, rather than claiming a completed transition. */
+export const commandOutputSchema = {
+  threadId: z.string(),
+  action: z.enum(["thread.turn.interrupt", "thread.session.stop", "thread.settle", "thread.unsettle"]),
+  sequence: z.number().int().nonnegative(),
+};
+
+export const configOutputSchema = {
+  config: z.record(z.unknown()),
+};
+
 /** Structured state after a turn start, for t3_send_prompt and t3_send_message. */
-function turnStarted(threadId: string, projectId: string, snapshot: T3ThreadDetailSnapshot | null) {
+function turnStarted(
+  threadId: string,
+  projectId: string,
+  snapshot: T3ThreadDetailSnapshot | null,
+  sequence: number,
+  events: unknown[],
+) {
   const detail = snapshot ? threadDetail(snapshot, 0, 0) : null;
   return {
+    sequence,
+    events,
+    snapshotAvailable: snapshot !== null,
+    snapshotSequence: snapshot?.snapshotSequence ?? null,
     threadId,
     projectId: detail?.projectId ?? projectId,
     branch: detail?.branch ?? null,
@@ -515,7 +490,29 @@ export function registerTools(
   client: T3Client,
   usageOptions: UsageProbeOptions,
 ): void {
-  server.registerTool(
+  const handlers = new Map<string, (args: unknown) => Promise<CallToolResult>>();
+
+  // Keep SDK tool discovery, but validate calls here so validation failures and
+  // unknown-tool errors have the same structured representation as tool errors.
+  function registerTool<Input extends z.ZodRawShape, Output extends z.ZodRawShape>(
+    name: string,
+    config: { description: string; inputSchema: Input; outputSchema: Output },
+    handler: (args: z.infer<z.ZodObject<Input>>) => Promise<CallToolResult>,
+  ): void {
+    const invoke = async (args: unknown): Promise<CallToolResult> => {
+      try {
+        const result = await handler(z.object(config.inputSchema).parse(args ?? {}));
+        if (!result.isError) z.object(config.outputSchema).strict().parse(result.structuredContent);
+        return result;
+      } catch (error) {
+        return errorResult(error);
+      }
+    };
+    server.registerTool<z.ZodRawShape, z.ZodRawShape>(name, config, invoke);
+    handlers.set(name, invoke);
+  }
+
+  registerTool(
     "t3_list_threads",
     {
       description:
@@ -524,34 +521,31 @@ export function registerTools(
         "structuredContent also lists every project with its ID and workspace root.",
       outputSchema: threadListOutputSchema,
       inputSchema: {
-      query: z
-        .string()
-        .min(1)
-        .optional()
-        .describe("Case-insensitive substring filter on thread title or ID"),
-      limit: z
-        .number()
-        .int()
-        .min(1)
-        .max(50)
-        .optional()
-        .describe("Maximum number of threads to return. Default 20."),
+        query: z
+          .string()
+          .min(1)
+          .optional()
+          .describe("Case-insensitive substring filter on thread title or ID"),
+        limit: z
+          .number()
+          .int()
+          .min(1)
+          .max(50)
+          .optional()
+          .describe("Maximum number of threads to return. Default 20."),
       },
     },
     async ({ query, limit }) => {
       try {
         const readModel = await client.getReadModel();
-        return structuredResult(
-          formatThreadRows(readModel, { query, limit }),
-          listThreads(readModel, { query, limit }),
-        );
+        return structuredResult(listThreads(readModel, { query, limit }));
       } catch (error) {
         return errorResult(error);
       }
     },
   );
 
-  server.registerTool(
+  registerTool(
     "t3_get_thread",
     {
       description:
@@ -561,28 +555,27 @@ export function registerTools(
         "keeps the full message text and gives lastAssistantMessage.",
       outputSchema: threadDetailOutputSchema,
       inputSchema: {
-      threadId: z.string().min(1).describe("T3 Code thread ID (from t3_list_threads or t3_send_prompt)"),
-      messageLimit: z
-        .number()
-        .int()
-        .min(0)
-        .max(50)
-        .optional()
-        .describe("How many recent messages to include. Default 10."),
-      activityLimit: z
-        .number()
-        .int()
-        .min(0)
-        .max(50)
-        .optional()
-        .describe("How many recent activities to include. Default 10."),
+        threadId: z.string().min(1).describe("T3 Code thread ID (from t3_list_threads or t3_send_prompt)"),
+        messageLimit: z
+          .number()
+          .int()
+          .min(0)
+          .max(50)
+          .optional()
+          .describe("How many recent messages to include. Default 10."),
+        activityLimit: z
+          .number()
+          .int()
+          .min(0)
+          .max(50)
+          .optional()
+          .describe("How many recent activities to include. Default 10."),
       },
     },
     async ({ threadId, messageLimit, activityLimit }) => {
       try {
         const snapshot = await client.getThreadSnapshot(threadId);
         return structuredResult(
-          formatThreadDetail(snapshot, messageLimit ?? 10, activityLimit ?? 10),
           threadDetail(snapshot, messageLimit ?? 10, activityLimit ?? 10),
         );
       } catch (error) {
@@ -591,7 +584,7 @@ export function registerTools(
     },
   );
 
-  server.registerTool(
+  registerTool(
     "t3_rename_thread",
     {
       description:
@@ -613,7 +606,6 @@ export function registerTools(
           title,
         });
         return structuredResult(
-          `Renamed thread ${threadId}: ${title}`,
           { threadId, title, previousTitle: before.thread.title, sequence: result.sequence },
         );
       } catch (error) {
@@ -622,7 +614,7 @@ export function registerTools(
     },
   );
 
-  server.registerTool(
+  registerTool(
     "t3_send_prompt",
     {
       description:
@@ -635,85 +627,85 @@ export function registerTools(
         "worktree path, and turn state.",
       outputSchema: turnStartedOutputSchema,
       inputSchema: {
-      prompt: z.string().min(1).describe("Coding task or question to send to T3 Code"),
-      title: z.string().trim().min(1).optional().describe("Thread name. Defaults to the first 80 prompt characters."),
-      projectId: z
-        .string()
-        .min(1)
-        .optional()
-        .describe("Existing T3 Code project ID. Omit to create a project."),
-      workspaceRoot: z
-        .string()
-        .min(1)
-        .optional()
-        .describe("Absolute workspace path. Required when projectId is omitted."),
-      instanceId: z
-        .string()
-        .min(1)
-        .describe("Configured T3 provider instance ID returned by t3_get_config"),
-      model: z.string().min(1).describe("Model slug returned by t3_get_config"),
-      modelOptions: z
-        .record(z.string(), z.union([z.string(), z.boolean()]))
-        .optional()
-        .describe(
-          "Model option values keyed by option ID from the model's " +
-            "capabilities.optionDescriptors in t3_get_config (e.g. reasoningEffort " +
-            "for Codex, effort for Claude, variant for OpenCode; also serviceTier, " +
-            "fastMode, contextWindow, agent). Omit to use T3 defaults.",
-        ),
-      runtimeMode: z
-        .enum(["approval-required", "auto-accept-edits", "auto", "full-access"])
-        .optional()
-        .describe("T3 runtime mode. Defaults to full-access."),
-      interactionMode: z
-        .enum(["default", "plan"])
-        .optional()
-        .describe("Provider interaction mode. Defaults to default."),
-      branch: z
-        .string()
-        .min(1)
-        .optional()
-        .describe(
-          "Branch name to record on the thread. With baseBranch, T3 creates the " +
-            "new worktree on this new branch. With worktreePath, it records the " +
-            "branch of the reused worktree.",
-        ),
-      worktreePath: z
-        .string()
-        .min(1)
-        .optional()
-        .describe(
-          "Absolute path of an existing git worktree for the thread to reuse. " +
-            "Cannot be combined with baseBranch.",
-        ),
-      baseBranch: z
-        .string()
-        .min(1)
-        .optional()
-        .describe(
-          "Base branch (e.g. main) for T3 to create a fresh git worktree from " +
-            "the project checkout. Requires a git repository. The worktree stays " +
-            "on disk after the thread settles; remove it with git worktree remove " +
-            "when done. Cannot be combined with worktreePath.",
-        ),
-      startFromOrigin: z
-        .boolean()
-        .optional()
-        .describe("Fetch baseBranch from origin before creating the worktree. Only with baseBranch."),
-      runSetupScript: z
-        .boolean()
-        .optional()
-        .describe(
-          "Run the project's setup script in a created worktree. Defaults to true. " +
-            "Only with baseBranch.",
-        ),
-      waitMs: z
-        .number()
-        .int()
-        .min(0)
-        .max(120_000)
-        .optional()
-        .describe("Milliseconds to collect response events before returning. Default 30000."),
+        prompt: z.string().min(1).describe("Coding task or question to send to T3 Code"),
+        title: z.string().trim().min(1).optional().describe("Thread name. Defaults to the first 80 prompt characters."),
+        projectId: z
+          .string()
+          .min(1)
+          .optional()
+          .describe("Existing T3 Code project ID. Omit to create a project."),
+        workspaceRoot: z
+          .string()
+          .min(1)
+          .optional()
+          .describe("Absolute workspace path. Required when projectId is omitted."),
+        instanceId: z
+          .string()
+          .min(1)
+          .describe("Configured T3 provider instance ID returned by t3_get_config"),
+        model: z.string().min(1).describe("Model slug returned by t3_get_config"),
+        modelOptions: z
+          .record(z.string(), z.union([z.string(), z.boolean()]))
+          .optional()
+          .describe(
+            "Model option values keyed by option ID from the model's " +
+              "capabilities.optionDescriptors in t3_get_config (e.g. reasoningEffort " +
+              "for Codex, effort for Claude, variant for OpenCode; also serviceTier, " +
+              "fastMode, contextWindow, agent). Omit to use T3 defaults.",
+          ),
+        runtimeMode: z
+          .enum(["approval-required", "auto-accept-edits", "auto", "full-access"])
+          .optional()
+          .describe("T3 runtime mode. Defaults to full-access."),
+        interactionMode: z
+          .enum(["default", "plan"])
+          .optional()
+          .describe("Provider interaction mode. Defaults to default."),
+        branch: z
+          .string()
+          .min(1)
+          .optional()
+          .describe(
+            "Branch name to record on the thread. With baseBranch, T3 creates the " +
+              "new worktree on this new branch. With worktreePath, it records the " +
+              "branch of the reused worktree.",
+          ),
+        worktreePath: z
+          .string()
+          .min(1)
+          .optional()
+          .describe(
+            "Absolute path of an existing git worktree for the thread to reuse. " +
+              "Cannot be combined with baseBranch.",
+          ),
+        baseBranch: z
+          .string()
+          .min(1)
+          .optional()
+          .describe(
+            "Base branch (e.g. main) for T3 to create a fresh git worktree from " +
+              "the project checkout. Requires a git repository. The worktree stays " +
+              "on disk after the thread settles; remove it with git worktree remove " +
+              "when done. Cannot be combined with worktreePath.",
+          ),
+        startFromOrigin: z
+          .boolean()
+          .optional()
+          .describe("Fetch baseBranch from origin before creating the worktree. Only with baseBranch."),
+        runSetupScript: z
+          .boolean()
+          .optional()
+          .describe(
+            "Run the project's setup script in a created worktree. Defaults to true. " +
+              "Only with baseBranch.",
+          ),
+        waitMs: z
+          .number()
+          .int()
+          .min(0)
+          .max(120_000)
+          .optional()
+          .describe("Milliseconds to collect response events before returning. Default 30000."),
       },
     },
     async ({
@@ -787,7 +779,7 @@ export function registerTools(
         const threadId = randomUUID();
         const threadTitle = title ?? prompt.slice(0, 80);
         const threadBranch = branch ?? null;
-        let worktreeSummary: string;
+        let sequence: number;
 
         if (baseBranch) {
           // Native isolated-worktree flow: the server creates the thread and
@@ -795,8 +787,7 @@ export function registerTools(
           if (!projectCwd) {
             throw new Error("baseBranch requires a project workspace root");
           }
-          worktreeSummary = `Worktree: creating from ${baseBranch}${branch ? ` on new branch ${branch}` : ""}`;
-          await client.dispatchCommand({
+          sequence = (await client.dispatchCommand({
             type: "thread.turn.start",
             commandId: commandId(),
             threadId,
@@ -829,14 +820,8 @@ export function registerTools(
               ...((runSetupScript ?? true) ? { runSetupScript: true } : {}),
             },
             createdAt: now(),
-          });
+          })).sequence;
         } else {
-          worktreeSummary = worktreePath
-            ? `Worktree: reusing ${worktreePath}${branch ? ` (branch ${branch})` : ""}`
-            : branch
-              ? `Branch: ${branch} (project checkout)`
-              : "Worktree: project checkout";
-
           await client.dispatchCommand({
             type: "thread.create",
             commandId: commandId(),
@@ -851,7 +836,7 @@ export function registerTools(
             createdAt: now(),
           });
 
-          await client.dispatchCommand({
+          sequence = (await client.dispatchCommand({
             type: "thread.turn.start",
             commandId: commandId(),
             threadId,
@@ -865,7 +850,7 @@ export function registerTools(
             runtimeMode: resolvedRuntimeMode,
             interactionMode: resolvedInteractionMode,
             createdAt: now(),
-          });
+          })).sequence;
         }
 
         const events = await collectThreadEvents(client, threadId, waitMs ?? 30_000);
@@ -875,30 +860,18 @@ export function registerTools(
         try {
           after = await client.getThreadSnapshot(threadId);
         } catch {
-          // The events below already carry the response; a missing snapshot
+          // The structured events already carry the response; a missing snapshot
           // must not fail the whole call.
         }
-        const createdWorktreePath = after?.thread.worktreePath ?? null;
 
-        return structuredResult(
-          [
-            `Thread created: ${threadId}`,
-            `Project: ${resolvedProjectId}`,
-            worktreeSummary,
-            ...(createdWorktreePath ? [`Worktree path: ${createdWorktreePath}`] : []),
-            "",
-            "Response events:",
-            formatThreadEvents(events),
-          ].join("\n"),
-          turnStarted(threadId, resolvedProjectId, after),
-        );
+        return structuredResult(turnStarted(threadId, resolvedProjectId, after, sequence, events));
       } catch (error) {
         return errorResult(error);
       }
     },
   );
 
-  server.registerTool(
+  registerTool(
     "t3_send_message",
     {
       description:
@@ -910,15 +883,15 @@ export function registerTools(
         "structuredContent gives the turn state after waitMs.",
       outputSchema: turnStartedOutputSchema,
       inputSchema: {
-      threadId: z.string().min(1).describe("Thread ID from t3_send_prompt or t3_list_threads"),
-      prompt: z.string().min(1).describe("Message to send to the agent of the thread"),
-      waitMs: z
-        .number()
-        .int()
-        .min(0)
-        .max(120_000)
-        .optional()
-        .describe("Milliseconds to collect response events before returning. Default 30000."),
+        threadId: z.string().min(1).describe("Thread ID from t3_send_prompt or t3_list_threads"),
+        prompt: z.string().min(1).describe("Message to send to the agent of the thread"),
+        waitMs: z
+          .number()
+          .int()
+          .min(0)
+          .max(120_000)
+          .optional()
+          .describe("Milliseconds to collect response events before returning. Default 30000."),
       },
     },
     async ({ threadId, prompt, waitMs }) => {
@@ -957,149 +930,114 @@ export function registerTools(
           // The events already carry the response; see t3_send_prompt.
         }
 
-        return structuredResult(
-          [
-            `Message sent to thread ${threadId} (sequence ${result.sequence})`,
-            ...(thread.worktreePath ? [`Worktree: ${thread.worktreePath}`] : []),
-            "",
-            "Response events:",
-            formatThreadEvents(events),
-          ].join("\n"),
-          turnStarted(threadId, thread.projectId, after ?? snapshot),
-        );
+        return structuredResult(turnStarted(threadId, thread.projectId, after, result.sequence, events));
       } catch (error) {
         return errorResult(error);
       }
     },
   );
 
-  server.tool(
+  registerTool(
     "t3_get_status",
-    "Get the current state of a T3 Code thread: an immediate snapshot plus, " +
-      "optionally, live events collected for waitMs milliseconds.",
     {
-      threadId: z.string().min(1).describe("Thread ID returned by t3_send_prompt or t3_list_threads"),
-      waitMs: z
-        .number()
-        .int()
-        .min(0)
-        .max(120_000)
-        .optional()
-        .describe(
-          "Milliseconds to additionally collect live events after the snapshot. Default 0.",
-        ),
+      description: "Get an immediate thread snapshot plus an optional live event tail. " +
+        "Snapshot fields describe the state before the tail; events preserve full payloads.",
+      outputSchema: threadStatusOutputSchema,
+      inputSchema: {
+        threadId: z.string().min(1).describe("Thread ID from t3_send_prompt or t3_list_threads"),
+        waitMs: z.number().int().min(0).max(120_000).optional()
+          .describe("Milliseconds to collect live events after the snapshot. Default 0."),
+      },
     },
     async ({ threadId, waitMs }) => {
       try {
         const snapshot = await client.getThreadSnapshot(threadId);
         const tailMs = waitMs ?? 0;
-
-        if (tailMs === 0) {
-          return textResult(formatThreadDetail(snapshot));
-        }
-
-        const events = await collectThreadEvents(
-          client,
-          threadId,
-          tailMs,
-          snapshot.snapshotSequence,
-        );
-        return textResult(
-          [
-            formatThreadDetail(snapshot),
-            "",
-            `Live events (${tailMs}ms):`,
-            formatThreadEvents(events),
-          ].join("\n"),
-        );
+        const events = await collectThreadEvents(client, threadId, tailMs, snapshot.snapshotSequence);
+        return structuredResult({ ...threadDetail(snapshot), events, waitMs: tailMs });
       } catch (error) {
         return errorResult(error);
       }
     },
   );
 
-  server.tool(
+  registerTool(
     "t3_interrupt",
-    "Interrupt the currently running turn in a T3 Code thread.",
     {
-      threadId: z.string().min(1).describe("Thread ID to interrupt"),
-      turnId: z.string().min(1).optional().describe("Specific turn ID to interrupt"),
+      description: "Interrupt the currently running turn in a T3 Code thread. Returns a dispatch acknowledgement.",
+      outputSchema: commandOutputSchema,
+      inputSchema: {
+        threadId: z.string().min(1).describe("Thread ID to interrupt"),
+        turnId: z.string().min(1).optional().describe("Specific turn ID to interrupt"),
+      },
     },
     async ({ threadId, turnId }) => {
       try {
+        const action = "thread.turn.interrupt" as const;
         const result = await client.dispatchCommand({
-          type: "thread.turn.interrupt",
+          type: action,
           commandId: commandId(),
           threadId,
           ...(turnId ? { turnId } : {}),
           createdAt: now(),
         });
-        return textResult(`Interrupt dispatched. Sequence: ${result.sequence}`);
+        return structuredResult({ threadId, action, sequence: result.sequence });
       } catch (error) {
         return errorResult(error);
       }
     },
   );
 
-  server.tool(
+  registerTool(
     "t3_stop_session",
-    "Stop the provider session for a T3 Code thread.",
     {
-      threadId: z.string().min(1).describe("Thread ID whose provider session should stop"),
+      description: "Stop the provider session for a T3 Code thread. Returns a dispatch acknowledgement.",
+      outputSchema: commandOutputSchema,
+      inputSchema: { threadId: z.string().min(1).describe("Thread ID whose provider session should stop") },
     },
     async ({ threadId }) => {
       try {
-        const result = await client.dispatchCommand({
-          type: "thread.session.stop",
-          commandId: commandId(),
-          threadId,
-          createdAt: now(),
-        });
-        return textResult(`Session stop dispatched. Sequence: ${result.sequence}`);
+        const action = "thread.session.stop" as const;
+        const result = await client.dispatchCommand({ type: action, commandId: commandId(), threadId, createdAt: now() });
+        return structuredResult({ threadId, action, sequence: result.sequence });
       } catch (error) {
         return errorResult(error);
       }
     },
   );
 
-  server.tool(
+  registerTool(
     "t3_settle_thread",
-    "Mark a T3 Code thread as settled, or pass settled=false to mark it active again. " +
-      "T3 refuses to settle while the session is starting or running, while an " +
-      "approval or user-input request is open, or while a turn start is queued; " +
-      "wait, or call t3_interrupt first.",
     {
-      threadId: z.string().min(1).describe("Thread ID to settle or unsettle"),
-      settled: z
-        .boolean()
-        .optional()
-        .describe("true settles the thread, false unsettles it. Default true."),
+      description: "Mark a thread settled, or active again with settled=false. Returns a dispatch acknowledgement. " +
+        "T3 refuses to settle while the session is starting/running, a request is open, or a turn start is queued.",
+      outputSchema: commandOutputSchema,
+      inputSchema: {
+        threadId: z.string().min(1).describe("Thread ID to settle or unsettle"),
+        settled: z.boolean().optional().describe("true settles, false unsettles. Default true."),
+      },
     },
     async ({ threadId, settled }) => {
       try {
-        const settle = settled ?? true;
-        const result = await client.dispatchCommand(
-          settle
-            ? { type: "thread.settle", commandId: commandId(), threadId }
-            : { type: "thread.unsettle", commandId: commandId(), threadId, reason: "user" },
-        );
-        return textResult(
-          `${settle ? "Settle" : "Unsettle"} dispatched for thread ${threadId}. ` +
-            `Sequence: ${result.sequence}`,
-        );
+        const action = (settled ?? true) ? "thread.settle" : "thread.unsettle";
+        const result = await client.dispatchCommand({
+          type: action, commandId: commandId(), threadId,
+          ...(action === "thread.unsettle" ? { reason: "user" } : {}),
+        });
+        return structuredResult({ threadId, action, sequence: result.sequence });
       } catch (error) {
         return errorResult(error);
       }
     },
   );
 
-  server.registerTool(
+  registerTool(
     "t3_get_usage_limits",
     {
       description:
-        "Get provider subscription usage limits: Codex (ChatGPT) and Claude Code " +
-        "from T3, plus Antigravity and OpenCode Go from their own usage sources " +
-        "when configured. Reports used and remaining percent and the reset time " +
+        "Get provider subscription usage limits, including OpenCode Go, from T3. " +
+        "An optional Antigravity CLI probe fills missing data. Reports used and " +
+        "remaining percent and the reset time " +
         "for each quota window (5h session, rolling, weekly, monthly). Models in " +
         "one pool share its windows. structuredContent holds the same data as JSON.",
       inputSchema: {},
@@ -1109,26 +1047,34 @@ export function registerTools(
       try {
         const config = (await client.getConfig()) as T3UsageLimitSource;
         const report = await collectUsageReport(config, usageOptions);
-        return {
-          content: [{ type: "text" as const, text: formatUsageReport(report) }],
-          structuredContent: report as unknown as Record<string, unknown>,
-        };
+        return structuredResult(report);
       } catch (error) {
         return errorResult(error);
       }
     },
   );
 
-  server.tool(
+  registerTool(
     "t3_get_config",
-    "Retrieve T3 Code server configuration, including provider instances and models.",
-    {},
+    {
+      description: "Retrieve T3 Code server configuration, including provider instances and models. " +
+        "The config field preserves all server-provided fields.",
+      inputSchema: {},
+      outputSchema: configOutputSchema,
+    },
     async () => {
       try {
-        return textResult(JSON.stringify(await client.getConfig(), null, 2));
+        return structuredResult({ config: z.record(z.unknown()).parse(await client.getConfig()) });
       } catch (error) {
         return errorResult(error);
       }
     },
   );
+
+  server.server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const handler = handlers.get(request.params.name);
+    if (!handler) return errorResult(new Error(`Tool ${request.params.name} not found`));
+    if (request.params.task) return errorResult(new Error("These tools do not support MCP tasks"));
+    return handler(request.params.arguments);
+  });
 }
