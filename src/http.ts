@@ -107,6 +107,18 @@ export async function serveStreamableHttp(
       session = { server, transport };
     }
 
+    if (!session && sessionId) {
+      // An unknown session ID means the session ended, for example after a
+      // service restart. The Streamable HTTP spec requires 404 here; it tells
+      // the client to initialize a new session instead of failing every call.
+      sendJson(res, 404, {
+        jsonrpc: "2.0",
+        error: { code: -32001, message: "Session not found" },
+        id: null,
+      });
+      return;
+    }
+
     if (!session) {
       sendJson(res, 400, {
         jsonrpc: "2.0",
