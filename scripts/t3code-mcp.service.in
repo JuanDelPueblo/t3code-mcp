@@ -1,0 +1,52 @@
+# t3code-mcp as a user service next to T3 Code's own user unit.
+# scripts/deploy.sh fills the @...@ values and installs this file as
+# ~/.config/systemd/user/t3code-mcp.service. Do not edit the installed copy;
+# change this template and deploy again.
+
+[Unit]
+Description=T3 Code MCP bridge
+After=network.target t3code.service
+Requires=t3code.service
+RequiresMountsFor=@INSTALL_ROOT@ @T3_HOME@
+
+[Service]
+Environment=MCP_TRANSPORT=http
+Environment=MCP_HTTP_HOST=127.0.0.1
+Environment=MCP_HTTP_PORT=@MCP_PORT@
+Environment=MCP_HTTP_PATH=/mcp
+Environment=T3_CODE_URL=http://127.0.0.1:@T3_PORT@
+Environment=T3_CODE_BASE_DIR=@T3_HOME@
+Environment=T3_CODE_CLI=@T3_CLI@
+Environment=T3_CODE_PAIRING_TTL=5m
+Environment=T3_CODE_PAIRING_LABEL=t3code-mcp
+Environment=T3_USAGE_ANTIGRAVITY_CLI=@AGY_CLI@
+# T3 Code needs up to a few minutes to listen after it starts.
+ExecStartPre=/bin/bash -c 'for _ in $$(seq 300); do (exec 3<>/dev/tcp/127.0.0.1/@T3_PORT@) 2>/dev/null && exit 0; sleep 1; done; echo "T3 Code is not listening on @T3_PORT@" >&2; exit 1'
+ExecStart=@NODE@ @INSTALL_ROOT@/current/dist/index.js
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=6min
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+PrivateDevices=true
+ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+# Local pairing and the read-only native-session lookup use T3's home.
+ReadWritePaths=@T3_HOME@
+UMask=0077
+
+[Install]
+WantedBy=default.target

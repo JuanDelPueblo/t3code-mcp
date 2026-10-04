@@ -415,16 +415,31 @@ codex mcp get t3code
 opencode mcp list
 ```
 
-## Deployment on Fedora
+## Deployment as a user service
 
-The Fedora host runs the bridge as the user unit `t3code-mcp.service` from
-`/opt/t3code-mcp`. `scripts/deploy.sh` type-checks, tests, and builds the
-checkout, installs it there with production dependencies (sudo), restarts the
-unit, and checks that the new tool list is served:
+The bridge runs as the user unit `t3code-mcp.service`, next to T3 Code's own
+user unit. `scripts/deploy.sh` runs as your user, with no sudo:
 
 ```bash
 scripts/deploy.sh
 ```
+
+It type-checks, tests, and builds the checkout, then:
+
+1. installs it with production dependencies into
+   `<install root>/versions/<version>-<commit>/`;
+2. writes `~/.config/systemd/user/t3code-mcp.service` from
+   `scripts/t3code-mcp.service.in`, with T3's home and port read from
+   `t3code.service`;
+3. switches the `current` link, restarts the unit, and checks that it serves
+   every tool of this build;
+4. switches back to the previous version if that check fails, and keeps the
+   three newest versions.
+
+The install root is `<apps>/t3code-mcp` when T3 lives in `<apps>/t3code/...`,
+otherwise `~/.local/share/t3code-mcp`. Override it with `T3CODE_MCP_ROOT`. A
+unit in `~/.config/systemd/user` takes precedence over one with the same name
+in `/etc/systemd/user`.
 
 ## Nix
 
