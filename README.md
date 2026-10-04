@@ -382,6 +382,16 @@ are managed by T3 Code.
 `--check` reports a warning and exit code 1 when T3 does not answer, or when
 the T3 CLI or the base directory is absent. It never prints a token or a key.
 
+### Restarts
+
+Clients keep working when the service restarts. A request that carries a
+session ID from before the restart is served statelessly by a fresh MCP server
+instead of being rejected, because some clients (Claude Code among them) never
+re-initialize after the spec's 404. Only cancelling an in-flight call and the
+standalone event stream need a live session, and they resume when the client
+next initializes. A call that was running during the restart fails once; call
+it again.
+
 ## Harness configuration
 
 A T3 worker can call the HTTP bridge through a project script.

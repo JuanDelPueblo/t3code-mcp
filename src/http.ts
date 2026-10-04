@@ -107,10 +107,27 @@ export async function serveStreamableHttp(
       session = { server, transport };
     }
 
+    if (!session && sessionId && req.method === "POST") {
+      // An unknown session ID means this server restarted. Some clients (Claude
+      // Code, for one) never re-initialize after the spec's 404, so serve the
+      // request statelessly instead: the tools keep no per-session state. Only
+      // cross-request features (cancelling an in-flight call, a standalone
+      // event stream) need a session, and they resume when the client next
+      // initializes.
+      const server = createMcpServer();
+      const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+      res.on("close", () => {
+        void transport.close();
+        void server.close();
+      });
+      await server.connect(transport);
+      await transport.handleRequest(req, res, body);
+      return;
+    }
+
     if (!session && sessionId) {
-      // An unknown session ID means the session ended, for example after a
-      // service restart. The Streamable HTTP spec requires 404 here; it tells
-      // the client to initialize a new session instead of failing every call.
+      // GET (standalone stream) or DELETE for a session this server does not
+      // know: the spec's 404 tells the client the session is gone.
       sendJson(res, 404, {
         jsonrpc: "2.0",
         error: { code: -32001, message: "Session not found" },

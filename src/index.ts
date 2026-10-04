@@ -19,7 +19,7 @@ function createMcpServer(): McpServer {
   const server = new McpServer(
     {
       name: "t3code-mcp",
-      version: "0.5.0",
+      version: "0.6.0",
       description: "MCP server for orchestrating T3 Code",
     },
     {
