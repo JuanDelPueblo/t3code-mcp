@@ -62,6 +62,10 @@ returns `isError: true` and this object in both output paths:
 
 Check `isError` before interpreting the success schema.
 
+Unknown argument names are refused with a list of the valid ones, so a
+misspelled option (for example `timeoutMs` on `t3_send_message`, which takes
+`waitTimeoutMs`) fails at once instead of being ignored.
+
 Version 0.3.0 changes text-only responses to JSON, wraps the configuration in
 `config`, and adds structured fields to the previously text-only tools. Clients
 that parsed prose should switch to `structuredContent` or parse the JSON block.

@@ -684,7 +684,18 @@ export function registerTools(
   ): void {
     const invoke = async (args: unknown, context: ToolContext = {}): Promise<CallToolResult> => {
       try {
-        const result = await handler(z.object(config.inputSchema).parse(args ?? {}), context);
+        const input = (args ?? {}) as Record<string, unknown>;
+        // Reject unknown argument names instead of silently ignoring them: an
+        // agent that writes timeoutMs for waitTimeoutMs must learn at once.
+        const valid = Object.keys(config.inputSchema);
+        const unknown = Object.keys(input).filter((key) => !valid.includes(key));
+        if (unknown.length) {
+          throw new Error(
+            `Unknown argument${unknown.length > 1 ? "s" : ""} for ${name}: ${unknown.join(", ")}. ` +
+              `Valid arguments: ${valid.join(", ") || "none"}.`,
+          );
+        }
+        const result = await handler(z.object(config.inputSchema).parse(input), context);
         if (!result.isError) z.object(config.outputSchema).strict().parse(result.structuredContent);
         return result;
       } catch (error) {

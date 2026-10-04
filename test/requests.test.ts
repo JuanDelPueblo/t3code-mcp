@@ -104,3 +104,18 @@ describe("t3_get_config compact view", () => {
     expect((full.structuredContent as { config: Record<string, unknown> }).config.keybindings).toBeDefined();
   });
 });
+
+describe("argument names", () => {
+  it("rejects an unknown argument and lists the valid ones", async () => {
+    const registered = new Map<string, (args: Record<string, unknown>) => Promise<Record<string, unknown>>>();
+    const client = { getThreadSnapshot: vi.fn(), dispatchCommand: vi.fn() };
+    registerTools({ registerTool: (name: string, _c: unknown, handler: never) => registered.set(name, handler),
+      server: { setRequestHandler: vi.fn() } } as never, client as never, { antigravityCli: null, timeoutMs: 1000 });
+    const result = await registered.get("t3_send_message")!({ threadId: "t1", prompt: "go", timeoutMs: 1000 });
+    expect(result.isError).toBe(true);
+    const message = (result.structuredContent as { error: { message: string } }).error.message;
+    expect(message).toContain("Unknown argument for t3_send_message: timeoutMs");
+    expect(message).toContain("waitTimeoutMs");
+    expect(client.dispatchCommand).not.toHaveBeenCalled();
+  });
+});
