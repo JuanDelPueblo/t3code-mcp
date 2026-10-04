@@ -3,14 +3,15 @@
 MCP server for orchestrating [T3 Code](https://github.com/pingdotgg/t3code).
 
 This fork targets the current T3 Code authentication and orchestration protocol used by
-T3 v0.0.44 and supports both local stdio clients and a long-running Streamable HTTP service.
+T3 v0.0.44 and v0.0.45 and supports both local stdio clients and a long-running Streamable HTTP service.
 
 ## MCP tools
 
 - `t3_get_config` — inspect configured provider instances and model catalogs under `config.providers`
 - `t3_get_usage_limits` — native T3 subscription usage, including OpenCode Go; optional Antigravity CLI fallback
 - `t3_list_threads` — discover existing threads with their current state, including threads started from the T3 UI or another client
-- `t3_get_thread` — immediate current snapshot of one thread: state, latest turn, messages, activities
+- `t3_get_thread` — immediate current snapshot of one thread: state, latest turn, messages, activities, and the provider's native session
+- `t3_wait` — block until watched threads need attention (turn ended, approval or input requested, session error), without polling
 - `t3_rename_thread` — change an existing thread's title
 - `t3_send_prompt` — create a project/thread and start a coding turn
 - `t3_send_message` — start another turn on an existing thread, in the same provider session
@@ -66,7 +67,9 @@ that parsed prose should switch to `structuredContent` or parse the JSON block.
 
 ## Sending prompts
 
-`t3_send_prompt` creates a project/thread and starts a coding turn. It accepts
+`t3_send_prompt` creates a thread and starts a coding turn. With `workspaceRoot`
+and no `projectId`, it reuses the active T3 project for that folder, or creates
+one if none exists. It accepts
 two option groups beyond the prompt, model, and project.
 
 Pass `title` to give a new thread a name. Without `title`, the tool uses the
@@ -100,6 +103,68 @@ worktree, so a later prompt can reuse the reported `worktreePath`. T3 leaves
 created worktrees on disk after the thread settles. Remove them with
 `git worktree remove` when done.
 
+## Waiting without polling
+
+A coordinator should never poll its workers. `t3_wait` blocks on T3's live
+shell stream (`orchestration.subscribeShell`) and returns when the watched
+threads need attention:
+
+```json
+{ "threadIds": ["worker-1", "reviewer-2"], "mode": "any", "until": "attention", "timeoutMs": 600000 }
+```
+
+- `mode`: `any` (default) returns when one thread is ready; `all` waits for every thread.
+- `until`: `attention` (default) also wakes on a pending approval or user-input
+  request; `turn-end` wakes only when the turn ends.
+- `afterSequence`: ignore thread state older than this orchestration sequence.
+  Pass the `sequence` from a send result to be sure the wait sees the new turn.
+- `timeoutMs`: 1000 to 3600000; default 600000.
+
+The check is level-triggered: a thread that already needs attention returns at
+once, and a newer user message than the latest turn counts as a queued turn,
+not an ended one. The result lists `ready` threads with a `reason`
+(`turn-completed`, `turn-error`, `turn-interrupted`, `turn-ended`, `idle`,
+`approval-requested`, `user-input-requested`, `session-error`, `not-found`) and
+their `lastAssistantMessage`, plus the `pending` threads. T3 may report an
+interrupted turn as `completed`.
+
+`status` is `ready`, `timeout` (call `t3_wait` again), or `cancelled` (the
+client cancelled the request). If T3 never answers during the wait, the tool
+returns an error instead of a timeout. A dropped stream is resubscribed; the
+new snapshot restores the full state.
+
+`t3_send_prompt` and `t3_send_message` accept the same wait as `waitUntil`
+(`attention` or `turn-end`) and `waitTimeoutMs`. The call then starts the turn
+and returns only when that thread needs attention, with the result in `wait`.
+
+While it waits, the server sends MCP progress notifications every 30 seconds
+when the request carries a `progressToken`, and it stops when the client
+cancels. Clients still apply their own tool timeout; set it above
+`timeoutMs`:
+
+| Client | Setting |
+| --- | --- |
+| Claude Code | `MCP_TOOL_TIMEOUT` environment variable, in milliseconds |
+| Codex CLI | `tool_timeout_sec` under `[mcp_servers.t3code]` (default 60) |
+| Hermes | `timeout` under `mcp_servers.t3code` |
+
+## Native sessions
+
+T3's APIs do not report the provider's own session ID. `t3_get_thread` reads
+it read-only from T3's local state database
+(`<T3 home>/userdata/state.sqlite`, table `provider_session_runtime`) and
+returns `nativeSession`:
+
+- `nativeSessionId`: the Claude session ID, the Codex thread ID, or the
+  OpenCode or Antigravity session ID
+- `resumeCursor`: T3's raw resume cursor
+- `provider`, `instanceId`, `status`, `lastSeenAt`
+
+This is a private schema, so the lookup returns `null` instead of failing when
+the database, table, or row is missing. The path comes from `T3_STATE_DB`, or
+`T3CODE_HOME` / `T3_CODE_BASE_DIR` plus `userdata/state.sqlite`. Set
+`T3_STATE_DB=""` to turn it off.
+
 ## Follow-up messages
 
 `t3_send_message` starts another turn on an existing thread. The agent
@@ -119,8 +184,8 @@ Intended usage:
 
 ```text
 t3_send_prompt → create worker thread
-worker settles
-t3_send_message(workerThreadId, "...") → wake/reuse worker
+t3_wait([workerThreadId]) → blocks until the worker needs attention
+t3_send_message(workerThreadId, "...", waitUntil: "attention") → revise and wait
 
 t3_send_message(orchestratorThreadId, "WORKER_DONE ...")
 → wake an existing orchestrator thread
@@ -314,6 +379,17 @@ codex mcp get t3code
 opencode mcp list
 ```
 
+## Deployment on Fedora
+
+The Fedora host runs the bridge as the user unit `t3code-mcp.service` from
+`/opt/t3code-mcp`. `scripts/deploy.sh` type-checks, tests, and builds the
+checkout, installs it there with production dependencies (sudo), restarts the
+unit, and checks that the new tool list is served:
+
+```bash
+scripts/deploy.sh
+```
+
 ## Nix
 
 The repository carries a native package and NixOS module:
@@ -371,6 +447,9 @@ T3 v0.0.44 uses:
 - batched stream `Chunk.values` with client acknowledgements
 - `orchestration.subscribeThread` streams `{kind: "snapshot"}`, `{kind: "synchronized"}`,
   and `{kind: "event"}` items
+- `orchestration.subscribeShell` streams `{kind: "snapshot"}` (every project and thread
+  summary) and then `{kind: "thread-upserted" | "project-upserted", sequence, ...}` items;
+  thread summaries carry `hasPendingApprovals`, `hasPendingUserInput`, and `latestUserMessageAt`
 - HTTP orchestration API with bearer auth:
   - `GET /api/orchestration/snapshot` — full read model of projects and threads
   - `GET /api/orchestration/threads/:threadId` — one thread's detail snapshot

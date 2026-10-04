@@ -44,6 +44,7 @@ const calls: Array<[string, Record<string, unknown>]> = [
   ["t3_interrupt", { threadId: "thread-1", turnId: "turn-1" }],
   ["t3_stop_session", { threadId: "thread-1" }],
   ["t3_settle_thread", { threadId: "thread-1" }],
+  ["t3_wait", { threadIds: ["thread-1"], timeoutMs: 1000 }],
   ["t3_get_usage_limits", {}],
   ["t3_get_config", {}],
 ];
@@ -73,6 +74,12 @@ describe("MCP structured output over a real client transport", () => {
         onItem(event);
         onItem({ kind: "event", event: { sequence: 79, type: "thread.settled", payload: {} } });
       }),
+      // An idle thread with no turns needs attention at once; tests can replace it.
+      subscribeShell: vi.fn((onItem: (item: unknown) => void, signal?: AbortSignal) =>
+        new Promise<void>((resolve) => {
+          signal?.addEventListener("abort", () => resolve(), { once: true });
+          onItem({ kind: "snapshot", snapshot: { snapshotSequence: 77, threads: [{ ...snapshot.thread, session: null }] } });
+        })),
     };
   }
 
@@ -124,6 +131,7 @@ describe("MCP structured output over a real client transport", () => {
     upstream.getReadModel.mockRejectedValue(failure);
     upstream.getThreadSnapshot.mockRejectedValue(failure);
     upstream.dispatchCommand.mockRejectedValue(failure);
+    upstream.subscribeShell.mockRejectedValue(failure);
     const result = await call(name, args);
     expect(result.isError).toBe(true);
     expectJsonMirror(result);
@@ -191,6 +199,34 @@ describe("MCP structured output over a real client transport", () => {
       }),
     }));
     expect(result.structuredContent).toMatchObject({ sequence: 78, worktreePath: snapshot.thread.worktreePath, snapshotAvailable: true });
+  });
+
+  it("streams progress keepalives during t3_wait and honors client cancellation", async () => {
+    upstream.subscribeShell.mockImplementation((onItem: (item: unknown) => void, signal?: AbortSignal) =>
+      new Promise<void>((resolve) => {
+        signal?.addEventListener("abort", () => resolve(), { once: true });
+        onItem({ kind: "snapshot", snapshot: { snapshotSequence: 77, threads: [{ ...snapshot.thread,
+          latestTurn: { turnId: "turn-1", state: "running", requestedAt: timestamp, startedAt: timestamp,
+            completedAt: null, assistantMessageId: null },
+          session: { status: "running", activeTurnId: "turn-1", lastError: null } }] } });
+      }));
+    vi.useFakeTimers({ toFake: ["setInterval"] });
+    const progress: number[] = [];
+    const controller = new AbortController();
+    const pending = client.callTool(
+      { name: "t3_wait", arguments: { threadIds: ["thread-1"], timeoutMs: 120_000 } },
+      undefined,
+      { signal: controller.signal, onprogress: (value) => progress.push(value.progress), timeout: 200_000 },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await vi.advanceTimersByTimeAsync(65_000);
+    vi.useRealTimers();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(progress.length).toBeGreaterThanOrEqual(2);
+    controller.abort();
+    await expect(pending).rejects.toThrow();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(upstream.subscribeShell).toHaveBeenCalledTimes(1);
   });
 
   it("acknowledges unsettle with the same lifecycle result shape", async () => {

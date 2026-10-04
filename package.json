@@ -1,6 +1,6 @@
 {
   "name": "t3code-mcp",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "MCP server for controlling T3 Code via Model Context Protocol",
   "license": "MIT",
   "type": "module",

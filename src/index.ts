@@ -4,6 +4,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { accessTokenProviderFromEnvironment } from "./auth.js";
 import { serveStreamableHttp } from "./http.js";
+import { nativeSessionLookup, stateDbPathFromEnvironment } from "./native-session.js";
 import { T3Client } from "./t3client.js";
 import { registerTools } from "./tools.js";
 import { usageProbeOptionsFromEnvironment } from "./usage.js";
@@ -12,12 +13,13 @@ const baseUrl = process.env.T3_CODE_URL ?? "http://127.0.0.1:3000";
 const accessTokenProvider = await accessTokenProviderFromEnvironment(baseUrl);
 const client = new T3Client({ baseUrl, accessTokenProvider });
 const usageOptions = usageProbeOptionsFromEnvironment();
+const nativeSession = nativeSessionLookup(stateDbPathFromEnvironment());
 
 function createMcpServer(): McpServer {
   const server = new McpServer(
     {
       name: "t3code-mcp",
-      version: "0.3.0",
+      version: "0.4.0",
       description: "MCP server for orchestrating T3 Code",
     },
     {
@@ -35,8 +37,13 @@ function createMcpServer(): McpServer {
         "   Pass modelOptions for reasoning/effort choices from t3_get_config,",
         "   baseBranch to create an isolated git worktree, or worktreePath to",
         "   reuse one.",
-        "4. Inspect current state with t3_get_thread or t3_get_status; both return",
-        "   an immediate snapshot and work for threads from any client.",
+        "4. Do not poll workers. Call t3_wait with their thread IDs; it blocks on",
+        "   T3's live stream until a turn ends or an approval/input is pending,",
+        "   then returns the ready threads with their last assistant message.",
+        "   Or pass waitUntil to t3_send_prompt/t3_send_message to start and wait",
+        "   in one call. A timeout status means call t3_wait again.",
+        "   t3_get_thread and t3_get_status return an immediate snapshot;",
+        "   t3_get_thread also reports the provider's native session ID.",
         "5. Call t3_send_message to start another turn on a settled thread; it",
         "   never creates a project, thread, branch, or worktree. Use it to wake",
         "   a worker thread or to send review findings back to the agent.",
@@ -50,7 +57,7 @@ function createMcpServer(): McpServer {
     },
   );
 
-  registerTools(server, client, usageOptions);
+  registerTools(server, client, usageOptions, { nativeSession });
   return server;
 }
 

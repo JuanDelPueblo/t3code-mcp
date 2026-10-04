@@ -6,6 +6,7 @@ import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { CallToolRequestSchema, type CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import type { NativeSessionLookup } from "./native-session.js";
 import {
   T3Client,
   type T3Project,
@@ -20,8 +21,13 @@ import {
   type T3UsageLimitSource,
   type UsageProbeOptions,
 } from "./usage.js";
+import { waitForThreads, type WaitResult } from "./wait.js";
 
 export type { T3UsageLimitSource } from "./usage.js";
+
+/** Longest single wait. Clients must allow at least this tool timeout to use it in full. */
+export const MAX_WAIT_MS = 3_600_000;
+const DEFAULT_WAIT_TIMEOUT_MS = 600_000;
 
 function now(): string {
   return new Date().toISOString();
@@ -335,6 +341,49 @@ export const threadDetailOutputSchema = {
   activities: z.array(z.object({ kind: z.string(), tone: z.string(), summary: z.string(), createdAt: z.string() })),
 };
 
+const nativeSessionSchema = z
+  .object({
+    provider: z.string().nullable(),
+    instanceId: z.string().nullable(),
+    status: z.string().nullable(),
+    nativeSessionId: z.string().nullable(),
+    resumeCursor: z.unknown(),
+    lastSeenAt: z.string().nullable(),
+    source: z.literal("t3-state-db"),
+  })
+  .nullable();
+
+/** Output schema of t3_get_thread: the detail plus the native provider session. */
+export const threadWithSessionOutputSchema = {
+  ...threadDetailOutputSchema,
+  nativeSession: nativeSessionSchema,
+};
+
+const threadWaitStateSchema = z.object({
+  threadId: z.string(),
+  title: z.string().nullable(),
+  reason: z.string().nullable(),
+  turnState: z.string(),
+  turnId: z.string().nullable(),
+  turnCompletedAt: z.string().nullable(),
+  sessionStatus: z.string(),
+  hasPendingApprovals: z.boolean(),
+  hasPendingUserInput: z.boolean(),
+  lastError: z.string().nullable(),
+  lastAssistantMessage: z.string().nullable(),
+});
+
+/** Output schema of t3_wait. Mirrors WaitResult in wait.ts. */
+export const waitOutputSchema = {
+  status: z.enum(["ready", "timeout", "cancelled"]),
+  until: z.enum(["attention", "turn-end"]),
+  mode: z.enum(["any", "all"]),
+  waitedMs: z.number().int().nonnegative(),
+  sequence: z.number().int().nonnegative().nullable(),
+  ready: z.array(threadWaitStateSchema),
+  pending: z.array(threadWaitStateSchema),
+};
+
 /** Output schema of t3_send_prompt and t3_send_message. */
 export const turnStartedOutputSchema = {
   sequence: z.number().int().nonnegative(),
@@ -349,6 +398,7 @@ export const turnStartedOutputSchema = {
   sessionStatus: z.string(),
   settled: z.boolean(),
   lastAssistantMessage: z.string().nullable(),
+  wait: z.object(waitOutputSchema).optional(),
 };
 
 export const threadRenamedOutputSchema = {
@@ -467,6 +517,7 @@ function turnStarted(
   snapshot: T3ThreadDetailSnapshot | null,
   sequence: number,
   events: unknown[],
+  wait?: WaitResult,
 ) {
   const detail = snapshot ? threadDetail(snapshot, 0, 0) : null;
   return {
@@ -482,33 +533,94 @@ function turnStarted(
     sessionStatus: detail?.sessionStatus ?? "unknown",
     settled: detail?.settled ?? false,
     lastAssistantMessage: detail?.lastAssistantMessage ?? null,
+    ...(wait ? { wait } : {}),
   };
+}
+
+/** What a handler sees of the MCP request: cancellation and progress keepalives. */
+export interface ToolContext {
+  signal?: AbortSignal;
+  progress?: (progress: number, message: string) => Promise<void>;
+}
+
+const waitInputShape = {
+  waitUntil: z
+    .enum(["attention", "turn-end"])
+    .optional()
+    .describe(
+      "Block until the thread needs attention before returning: attention = turn ended, " +
+        "approval or user input requested, or session error; turn-end ignores pending " +
+        "approvals and input. Omit to return after waitMs as before.",
+    ),
+  waitTimeoutMs: z
+    .number()
+    .int()
+    .min(1000)
+    .max(MAX_WAIT_MS)
+    .optional()
+    .describe("Longest block for waitUntil, in milliseconds. Default 600000. Keep it below the client's tool timeout."),
+};
+
+/** Fill each ready thread's last assistant message from its detail snapshot. */
+async function withMessages(client: T3Client, result: WaitResult): Promise<WaitResult> {
+  await Promise.all(
+    result.ready.map(async (state) => {
+      if (state.reason === "not-found") return;
+      try {
+        state.lastAssistantMessage = threadDetail(await client.getThreadSnapshot(state.threadId), 0, 0)
+          .lastAssistantMessage;
+      } catch {
+        // The wait result stays useful without the message.
+      }
+    }),
+  );
+  return result;
+}
+
+async function waitAfterDispatch(
+  client: T3Client,
+  context: ToolContext,
+  threadId: string,
+  sequence: number,
+  until: "attention" | "turn-end",
+  timeoutMs: number | undefined,
+): Promise<WaitResult> {
+  const result = await waitForThreads(client, {
+    threadIds: [threadId],
+    until,
+    timeoutMs: timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS,
+    afterSequence: sequence,
+    signal: context.signal,
+    onProgress: (ms) => context.progress?.(ms, `waiting on ${threadId}`),
+  });
+  return withMessages(client, result);
 }
 
 export function registerTools(
   server: McpServer,
   client: T3Client,
   usageOptions: UsageProbeOptions,
+  options: { nativeSession?: NativeSessionLookup | null } = {},
 ): void {
-  const handlers = new Map<string, (args: unknown) => Promise<CallToolResult>>();
+  const handlers = new Map<string, (args: unknown, context: ToolContext) => Promise<CallToolResult>>();
 
   // Keep SDK tool discovery, but validate calls here so validation failures and
   // unknown-tool errors have the same structured representation as tool errors.
   function registerTool<Input extends z.ZodRawShape, Output extends z.ZodRawShape>(
     name: string,
     config: { description: string; inputSchema: Input; outputSchema: Output },
-    handler: (args: z.infer<z.ZodObject<Input>>) => Promise<CallToolResult>,
+    handler: (args: z.infer<z.ZodObject<Input>>, context: ToolContext) => Promise<CallToolResult>,
   ): void {
-    const invoke = async (args: unknown): Promise<CallToolResult> => {
+    const invoke = async (args: unknown, context: ToolContext = {}): Promise<CallToolResult> => {
       try {
-        const result = await handler(z.object(config.inputSchema).parse(args ?? {}));
+        const result = await handler(z.object(config.inputSchema).parse(args ?? {}), context);
         if (!result.isError) z.object(config.outputSchema).strict().parse(result.structuredContent);
         return result;
       } catch (error) {
         return errorResult(error);
       }
     };
-    server.registerTool<z.ZodRawShape, z.ZodRawShape>(name, config, invoke);
+    server.registerTool<z.ZodRawShape, z.ZodRawShape>(name, config, (args: unknown) => invoke(args));
     handlers.set(name, invoke);
   }
 
@@ -552,8 +664,10 @@ export function registerTools(
         "Get the current snapshot of an existing T3 Code thread: state, latest turn, " +
         "recent messages and activities. Works for threads started from any client " +
         "and returns immediately without waiting for new events. structuredContent " +
-        "keeps the full message text and gives lastAssistantMessage.",
-      outputSchema: threadDetailOutputSchema,
+        "keeps the full message text and gives lastAssistantMessage. nativeSession " +
+        "gives the provider's own session ID (Claude session, Codex thread, OpenCode " +
+        "session) from T3's local state, or null when unavailable.",
+      outputSchema: threadWithSessionOutputSchema,
       inputSchema: {
         threadId: z.string().min(1).describe("T3 Code thread ID (from t3_list_threads or t3_send_prompt)"),
         messageLimit: z
@@ -575,9 +689,11 @@ export function registerTools(
     async ({ threadId, messageLimit, activityLimit }) => {
       try {
         const snapshot = await client.getThreadSnapshot(threadId);
-        return structuredResult(
-          threadDetail(snapshot, messageLimit ?? 10, activityLimit ?? 10),
-        );
+        const nativeSession = options.nativeSession ? await options.nativeSession(threadId) : null;
+        return structuredResult({
+          ...threadDetail(snapshot, messageLimit ?? 10, activityLimit ?? 10),
+          nativeSession,
+        });
       } catch (error) {
         return errorResult(error);
       }
@@ -624,7 +740,8 @@ export function registerTools(
         "to create an isolated git worktree, or worktreePath to reuse one; " +
         "t3_list_threads and t3_get_thread report each thread's branch and worktree. " +
         "Pass title to name the thread. structuredContent gives the thread ID, " +
-        "worktree path, and turn state.",
+        "worktree path, and turn state. Pass waitUntil to block until the new " +
+        "thread needs attention instead of polling it.",
       outputSchema: turnStartedOutputSchema,
       inputSchema: {
         prompt: z.string().min(1).describe("Coding task or question to send to T3 Code"),
@@ -705,7 +822,8 @@ export function registerTools(
           .min(0)
           .max(120_000)
           .optional()
-          .describe("Milliseconds to collect response events before returning. Default 30000."),
+          .describe("Milliseconds to collect response events before returning. Default 30000, or 0 with waitUntil."),
+        ...waitInputShape,
       },
     },
     async ({
@@ -724,7 +842,9 @@ export function registerTools(
       startFromOrigin,
       runSetupScript,
       waitMs,
-    }) => {
+      waitUntil,
+      waitTimeoutMs,
+    }, context) => {
       try {
         const resolvedRuntimeMode = runtimeMode ?? "full-access";
         const resolvedInteractionMode = interactionMode ?? "default";
@@ -749,6 +869,14 @@ export function registerTools(
 
         let resolvedProjectId = projectId;
         let projectCwd = workspaceRoot;
+
+        if (!resolvedProjectId && workspaceRoot) {
+          // T3 allows one active project per workspace root; reuse it.
+          const existing = (await client.getReadModel()).projects.find(
+            (candidate) => candidate.workspaceRoot.replace(/\/+$/, "") === workspaceRoot.replace(/\/+$/, ""),
+          );
+          if (existing) resolvedProjectId = existing.id;
+        }
 
         if (!resolvedProjectId) {
           if (!workspaceRoot) {
@@ -853,7 +981,10 @@ export function registerTools(
           })).sequence;
         }
 
-        const events = await collectThreadEvents(client, threadId, waitMs ?? 30_000);
+        const events = await collectThreadEvents(client, threadId, waitMs ?? (waitUntil ? 0 : 30_000));
+        const wait = waitUntil
+          ? await waitAfterDispatch(client, context, threadId, sequence, waitUntil, waitTimeoutMs)
+          : undefined;
 
         // Report the server-claimed worktree path when T3 created one.
         let after: T3ThreadDetailSnapshot | null = null;
@@ -864,7 +995,7 @@ export function registerTools(
           // must not fail the whole call.
         }
 
-        return structuredResult(turnStarted(threadId, resolvedProjectId, after, sequence, events));
+        return structuredResult(turnStarted(threadId, resolvedProjectId, after, sequence, events, wait));
       } catch (error) {
         return errorResult(error);
       }
@@ -891,10 +1022,11 @@ export function registerTools(
           .min(0)
           .max(120_000)
           .optional()
-          .describe("Milliseconds to collect response events before returning. Default 30000."),
+          .describe("Milliseconds to collect response events before returning. Default 30000, or 0 with waitUntil."),
+        ...waitInputShape,
       },
     },
-    async ({ threadId, prompt, waitMs }) => {
+    async ({ threadId, prompt, waitMs, waitUntil, waitTimeoutMs }, context) => {
       try {
         const snapshot = await client.getThreadSnapshot(threadId);
         const thread = snapshot.thread;
@@ -919,9 +1051,12 @@ export function registerTools(
         const events = await collectThreadEvents(
           client,
           threadId,
-          waitMs ?? 30_000,
+          waitMs ?? (waitUntil ? 0 : 30_000),
           snapshot.snapshotSequence,
         );
+        const wait = waitUntil
+          ? await waitAfterDispatch(client, context, threadId, result.sequence, waitUntil, waitTimeoutMs)
+          : undefined;
 
         let after: T3ThreadDetailSnapshot | null = null;
         try {
@@ -930,7 +1065,59 @@ export function registerTools(
           // The events already carry the response; see t3_send_prompt.
         }
 
-        return structuredResult(turnStarted(threadId, thread.projectId, after, result.sequence, events));
+        return structuredResult(turnStarted(threadId, thread.projectId, after, result.sequence, events, wait));
+      } catch (error) {
+        return errorResult(error);
+      }
+    },
+  );
+
+  registerTool(
+    "t3_wait",
+    {
+      description:
+        "Block until watched threads need attention, instead of polling them. Returns " +
+        "when any (or all, with mode=all) thread has ended its turn, requested an " +
+        "approval or user input, hit a session error, or no longer exists; a thread " +
+        "that already needs attention returns at once. Driven by T3's live shell " +
+        "stream. ready lists those threads with their last assistant message; status " +
+        "is timeout when timeoutMs passes first. Pass a dispatch sequence as " +
+        "afterSequence to ignore older state.",
+      outputSchema: waitOutputSchema,
+      inputSchema: {
+        threadIds: z.array(z.string().min(1)).min(1).max(50).describe("Thread IDs to watch"),
+        mode: z.enum(["any", "all"]).optional().describe("Return when any (default) or all threads are ready"),
+        until: z
+          .enum(["attention", "turn-end"])
+          .optional()
+          .describe("attention (default) also wakes on pending approvals or user input; turn-end does not"),
+        timeoutMs: z
+          .number()
+          .int()
+          .min(1000)
+          .max(MAX_WAIT_MS)
+          .optional()
+          .describe("Longest block in milliseconds. Default 600000. Keep it below the client's tool timeout."),
+        afterSequence: z
+          .number()
+          .int()
+          .nonnegative()
+          .optional()
+          .describe("Ignore thread state older than this orchestration sequence, for example a send result's sequence"),
+      },
+    },
+    async ({ threadIds, mode, until, timeoutMs, afterSequence }, context) => {
+      try {
+        const result = await waitForThreads(client, {
+          threadIds,
+          mode,
+          until,
+          timeoutMs: timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS,
+          afterSequence,
+          signal: context.signal,
+          onProgress: (ms) => context.progress?.(ms, `waiting on ${threadIds.length} thread(s)`),
+        });
+        return structuredResult(await withMessages(client, result));
       } catch (error) {
         return errorResult(error);
       }
@@ -1071,10 +1258,24 @@ export function registerTools(
     },
   );
 
-  server.server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  server.server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     const handler = handlers.get(request.params.name);
     if (!handler) return errorResult(new Error(`Tool ${request.params.name} not found`));
     if (request.params.task) return errorResult(new Error("These tools do not support MCP tasks"));
-    return handler(request.params.arguments);
+    const progressToken = request.params._meta?.progressToken;
+    const context: ToolContext = {
+      signal: extra.signal,
+      ...(progressToken !== undefined
+        ? {
+            progress: async (progress: number, message: string) => {
+              await extra.sendNotification({
+                method: "notifications/progress",
+                params: { progressToken, progress, message },
+              });
+            },
+          }
+        : {}),
+    };
+    return handler(request.params.arguments, context);
   });
 }

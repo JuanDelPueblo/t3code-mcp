@@ -476,4 +476,14 @@ export class T3Client {
       signal,
     );
   }
+
+  /**
+   * Stream the shell read model: every project and thread summary. The server
+   * emits `{kind: "snapshot"}` first, then one `{kind: "thread-upserted",
+   * sequence, thread}` (or `project-upserted`) item per change, so a caller can
+   * react to state changes on many threads without polling.
+   */
+  async subscribeShell(onItem: (item: unknown) => void, signal?: AbortSignal): Promise<void> {
+    return this.requestStream("orchestration.subscribeShell", {}, onItem, signal);
+  }
 }
