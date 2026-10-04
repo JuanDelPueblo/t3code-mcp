@@ -14,6 +14,13 @@
 
 set -euo pipefail
 
+if [[ "$EUID" -eq 0 ]]; then
+  echo "error: run deploy.sh as your own user, not with sudo." >&2
+  echo "       It calls sudo only to write $(printf '%s' "${T3CODE_MCP_DIR:-/opt/t3code-mcp}"), and it" >&2
+  echo "       must restart the service in your user systemd session." >&2
+  exit 1
+fi
+
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 target="${T3CODE_MCP_DIR:-/opt/t3code-mcp}"
 unit="${T3CODE_MCP_UNIT:-t3code-mcp.service}"

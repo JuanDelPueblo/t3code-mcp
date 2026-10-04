@@ -160,6 +160,9 @@ export async function waitForThreads(
   let synced = false;
   let everSynced = false;
   let lastError: unknown = null;
+  let failures = 0;
+  const baseDelay = options.reconnectDelayMs ?? 1000;
+  const retryDelay = () => Math.min(baseDelay * 2 ** Math.max(failures - 1, 0), Math.max(baseDelay, 30_000));
   let outcome: WaitResult["status"] | null = null;
 
   const satisfied = (): boolean => {
@@ -213,6 +216,10 @@ export async function waitForThreads(
             if (typeof snapshot?.snapshotSequence === "number") sequence = snapshot.snapshotSequence;
             synced = true;
             everSynced = true;
+            if (failures > 0) {
+              process.stderr.write(`t3_wait: shell stream restored after ${failures} failed attempt(s)\n`);
+              failures = 0;
+            }
           } else {
             if (typeof value.sequence === "number") sequence = Math.max(sequence ?? 0, value.sequence);
             const thread = record(value.thread) as T3ShellThread | null;
@@ -230,11 +237,13 @@ export async function waitForThreads(
         }, controller.signal);
       } catch (error) {
         lastError = error;
-        // The stream dropped (for example a T3 restart). Resubscribe: the new
-        // snapshot restores the full state, so no change is lost.
-        if (outcome === null && Date.now() + (options.reconnectDelayMs ?? 1000) >= deadline) {
+        failures += 1;
+        // The stream dropped (for example a T3 restart). Resubscribe with
+        // backoff: the new snapshot restores the full state, so no change is
+        // lost. Log the first failure of a streak only.
+        if (outcome === null && Date.now() + retryDelay() >= deadline) {
           outcome = "timeout";
-        } else if (outcome === null) {
+        } else if (outcome === null && failures === 1) {
           process.stderr.write(
             `t3_wait: shell stream dropped, resubscribing: ${error instanceof Error ? error.message : String(error)}\n`,
           );
@@ -244,7 +253,7 @@ export async function waitForThreads(
         options.signal?.removeEventListener("abort", onCancel);
       }
       if (outcome === null) {
-        await new Promise((resolve) => setTimeout(resolve, options.reconnectDelayMs ?? 1000));
+        await new Promise((resolve) => setTimeout(resolve, failures > 0 ? retryDelay() : baseDelay));
       }
     }
   } finally {
