@@ -724,9 +724,9 @@ export function registerTools(
           .number()
           .int()
           .min(1)
-          .max(50)
+          .max(200)
           .optional()
-          .describe("Maximum number of threads to return. Default 20."),
+          .describe("Maximum number of threads to return. Default 20, at most 200."),
       },
     },
     async ({ query, limit }) => {

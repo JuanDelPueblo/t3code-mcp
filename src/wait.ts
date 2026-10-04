@@ -52,6 +52,7 @@ const BUSY_SESSION_STATUSES = new Set(["starting", "running"]);
 export function attentionReason(
   thread: T3ShellThread | undefined,
   until: WaitUntil = "attention",
+  nowMs = Date.now(),
 ): WaitReason | null {
   if (!thread || thread.deletedAt) return "not-found";
 
@@ -64,7 +65,7 @@ export function attentionReason(
   if (status === "error") return "session-error";
 
   const turn = thread.latestTurn;
-  if (hasQueuedTurn(thread) || BUSY_SESSION_STATUSES.has(status) || thread.session?.activeTurnId) return null;
+  if (hasQueuedTurn(thread, nowMs) || BUSY_SESSION_STATUSES.has(status) || thread.session?.activeTurnId) return null;
   if (!turn) return "idle";
 
   switch (turn.state) {
@@ -123,10 +124,26 @@ export interface WaitOptions {
   reconnectDelayMs?: number;
 }
 
-/** A user message newer than the latest turn: T3 has queued a turn that has not started. */
-function hasQueuedTurn(thread: T3ShellThread): boolean {
+/** T3's own grace period for a user message that no turn has adopted yet. */
+export const QUEUED_TURN_START_GRACE_MS = 120_000;
+
+/**
+ * Whether T3 has queued a turn that has not started, by T3's own rule
+ * (threadHasQueuedTurnStart): a recent user message that is newer than the
+ * latest turn's request, start, and completion. Not every user message starts
+ * a turn (an answer to a question is one), so a message older than the grace
+ * period never counts, and a turn that completed after the message has
+ * already handled it.
+ */
+export function hasQueuedTurn(thread: T3ShellThread, nowMs = Date.now()): boolean {
+  if (!thread.latestUserMessageAt || thread.session?.status === "error") return false;
+  const messageAt = Date.parse(thread.latestUserMessageAt);
+  if (Number.isNaN(messageAt) || Math.abs(nowMs - messageAt) > QUEUED_TURN_START_GRACE_MS) return false;
   const turn = thread.latestTurn;
-  return !!thread.latestUserMessageAt && (!turn || thread.latestUserMessageAt > turn.requestedAt);
+  if (!turn) return true;
+  return [turn.requestedAt, turn.startedAt, turn.completedAt].every(
+    (value) => value == null || Date.parse(value) < messageAt,
+  );
 }
 
 function waitState(

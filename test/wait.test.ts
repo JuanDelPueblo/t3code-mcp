@@ -9,6 +9,13 @@ import { attentionReason, waitForThreads, type T3ShellThread } from "../src/wait
 
 type Emit = (item: unknown) => void;
 
+/** Pin Date (not timers) so T3's 120 s queued-message grace applies to fixed fixtures. */
+function clock(iso: string): void {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(new Date(iso));
+}
+afterEach(() => vi.useRealTimers());
+
 function thread(overrides: Partial<T3ShellThread> & { turn?: string | null } = {}): T3ShellThread {
   const { turn = "completed", ...rest } = overrides;
   return {
@@ -60,6 +67,7 @@ const upsert = (sequence: number, value: T3ShellThread) => ({ kind: "thread-upse
 
 describe("attentionReason", () => {
   it("treats a running turn, a busy session, or a queued message as busy", () => {
+    clock("2026-10-04T00:02:30.000Z");
     expect(attentionReason(thread({ turn: "running" }))).toBeNull();
     expect(attentionReason(thread({ session: { status: "starting" } }))).toBeNull();
     expect(attentionReason(thread({ latestUserMessageAt: "2026-10-04T00:02:00.000Z" }))).toBeNull();
@@ -108,6 +116,7 @@ describe("waitForThreads", () => {
   });
 
   it("ignores state older than afterSequence", async () => {
+    clock("2026-10-04T00:05:30.000Z");
     const client = shellClient(async (emit) => {
       emit(snapshot(10, [thread()]));
       await later(20);
@@ -216,6 +225,7 @@ describe("t3_wait tool", () => {
   });
 
   it("lets t3_send_message start a turn and wait for it in one call", async () => {
+    clock("2026-10-04T01:00:30.000Z");
     const dispatched: unknown[] = [];
     const client = {
       ...shellClient(async (emit) => {
@@ -326,10 +336,30 @@ describe("t3_send_prompt project reuse", () => {
 
 describe("queued turns", () => {
   it("reports a queued follow-up as queued, not as the previous completed turn", async () => {
+    clock("2026-10-04T00:09:30.000Z");
     const queued = thread({ latestUserMessageAt: "2026-10-04T00:09:00.000Z", session: { status: "starting" } });
     const client = shellClient((emit) => emit(snapshot(1, [queued])));
     const result = await waitForThreads(client, { threadIds: ["t1"], timeoutMs: 1000 });
     expect(result.status).toBe("timeout");
     expect(result.pending[0]).toMatchObject({ turnState: "queued", turnId: null, turnCompletedAt: null, sessionStatus: "starting" });
+  });
+});
+
+describe("messages that do not start a turn", () => {
+  it("does not treat an answered question as a queued turn once the turn completes", () => {
+    // The answer arrives mid-turn as a user message; the turn then completes after it.
+    clock("2026-10-04T00:05:00.000Z");
+    const answered = thread({ latestUserMessageAt: "2026-10-04T00:00:30.000Z",
+      latestTurn: { turnId: "turn-1", state: "completed", requestedAt: "2026-10-04T00:00:00.000Z",
+        startedAt: "2026-10-04T00:00:00.000Z", completedAt: "2026-10-04T00:04:00.000Z", assistantMessageId: null } });
+    expect(attentionReason(answered)).toBe("turn-completed");
+  });
+
+  it("stops counting a message as queued after T3's grace period", () => {
+    const stale = thread({ latestUserMessageAt: "2026-10-04T00:02:00.000Z" });
+    clock("2026-10-04T00:03:00.000Z");
+    expect(attentionReason(stale)).toBeNull();
+    clock("2026-10-04T00:05:00.000Z");
+    expect(attentionReason(stale)).toBe("turn-completed");
   });
 });
