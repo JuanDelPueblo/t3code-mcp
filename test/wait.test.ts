@@ -323,3 +323,13 @@ describe("t3_send_prompt project reuse", () => {
     expect(dispatched[0].projectId).toBe("existing");
   });
 });
+
+describe("queued turns", () => {
+  it("reports a queued follow-up as queued, not as the previous completed turn", async () => {
+    const queued = thread({ latestUserMessageAt: "2026-10-04T00:09:00.000Z", session: { status: "starting" } });
+    const client = shellClient((emit) => emit(snapshot(1, [queued])));
+    const result = await waitForThreads(client, { threadIds: ["t1"], timeoutMs: 1000 });
+    expect(result.status).toBe("timeout");
+    expect(result.pending[0]).toMatchObject({ turnState: "queued", turnId: null, turnCompletedAt: null, sessionStatus: "starting" });
+  });
+});

@@ -64,9 +64,7 @@ export function attentionReason(
   if (status === "error") return "session-error";
 
   const turn = thread.latestTurn;
-  const queued =
-    !!thread.latestUserMessageAt && (!turn || thread.latestUserMessageAt > turn.requestedAt);
-  if (queued || BUSY_SESSION_STATUSES.has(status) || thread.session?.activeTurnId) return null;
+  if (hasQueuedTurn(thread) || BUSY_SESSION_STATUSES.has(status) || thread.session?.activeTurnId) return null;
   if (!turn) return "idle";
 
   switch (turn.state) {
@@ -125,18 +123,26 @@ export interface WaitOptions {
   reconnectDelayMs?: number;
 }
 
+/** A user message newer than the latest turn: T3 has queued a turn that has not started. */
+function hasQueuedTurn(thread: T3ShellThread): boolean {
+  const turn = thread.latestTurn;
+  return !!thread.latestUserMessageAt && (!turn || thread.latestUserMessageAt > turn.requestedAt);
+}
+
 function waitState(
   threadId: string,
   thread: T3ShellThread | undefined,
   until: WaitUntil,
 ): ThreadWaitState {
+  // Report a queued turn as such, not as the previous turn's final state.
+  const queued = thread !== undefined && hasQueuedTurn(thread);
   return {
     threadId,
     title: thread?.title ?? null,
     reason: attentionReason(thread, until),
-    turnState: thread?.latestTurn?.state ?? (thread ? "no-turns" : "unknown"),
-    turnId: thread?.latestTurn?.turnId ?? null,
-    turnCompletedAt: thread?.latestTurn?.completedAt ?? null,
+    turnState: queued ? "queued" : (thread?.latestTurn?.state ?? (thread ? "no-turns" : "unknown")),
+    turnId: queued ? null : (thread?.latestTurn?.turnId ?? null),
+    turnCompletedAt: queued ? null : (thread?.latestTurn?.completedAt ?? null),
     sessionStatus: thread?.session?.status ?? (thread ? "no-session" : "unknown"),
     hasPendingApprovals: thread?.hasPendingApprovals ?? false,
     hasPendingUserInput: thread?.hasPendingUserInput ?? false,

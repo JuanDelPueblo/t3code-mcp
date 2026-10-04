@@ -126,8 +126,9 @@ once, and a newer user message than the latest turn counts as a queued turn,
 not an ended one. The result lists `ready` threads with a `reason`
 (`turn-completed`, `turn-error`, `turn-interrupted`, `turn-ended`, `idle`,
 `approval-requested`, `user-input-requested`, `session-error`, `not-found`) and
-their `lastAssistantMessage`, plus the `pending` threads. T3 may report an
-interrupted turn as `completed`.
+their `lastAssistantMessage`, plus the `pending` threads. A thread whose new
+turn T3 has accepted but not yet started reports `turnState: "queued"`. T3 may
+report an interrupted turn as `completed`.
 
 `status` is `ready`, `timeout` (call `t3_wait` again), or `cancelled` (the
 client cancelled the request). If T3 never answers during the wait, the tool
