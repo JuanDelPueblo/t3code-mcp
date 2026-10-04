@@ -7,6 +7,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { CallToolRequestSchema, type CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import type { NativeSessionLookup } from "./native-session.js";
+import { APPROVAL_DECISIONS, openRequests } from "./requests.js";
 import {
   T3Client,
   type T3Project,
@@ -341,6 +342,24 @@ export const threadDetailOutputSchema = {
   activities: z.array(z.object({ kind: z.string(), tone: z.string(), summary: z.string(), createdAt: z.string() })),
 };
 
+const pendingRequestSchema = z.object({
+  requestId: z.string(),
+  kind: z.enum(["approval", "user-input"]),
+  createdAt: z.string(),
+  summary: z.string(),
+  detail: z.string().nullable(),
+  requestKind: z.string().nullable(),
+  decisions: z.array(z.enum(APPROVAL_DECISIONS)),
+  questions: z.array(z.object({
+    id: z.string(),
+    header: z.string().nullable(),
+    question: z.string(),
+    options: z.array(z.object({ label: z.string(), description: z.string().nullable(), value: z.string().nullable() })),
+    allowCustomAnswer: z.boolean(),
+    multiSelect: z.boolean(),
+  })),
+});
+
 const nativeSessionSchema = z
   .object({
     provider: z.string().nullable(),
@@ -357,6 +376,16 @@ const nativeSessionSchema = z
 export const threadWithSessionOutputSchema = {
   ...threadDetailOutputSchema,
   nativeSession: nativeSessionSchema,
+  pendingRequests: z.array(pendingRequestSchema),
+};
+
+/** Output schema of t3_respond. */
+export const respondOutputSchema = {
+  threadId: z.string(),
+  requestId: z.string(),
+  action: z.enum(["thread.approval.respond", "thread.user-input.respond", "thread.user-input.dismiss"]),
+  decision: z.enum(APPROVAL_DECISIONS).nullable(),
+  sequence: z.number().int().nonnegative(),
 };
 
 const threadWaitStateSchema = z.object({
@@ -371,6 +400,7 @@ const threadWaitStateSchema = z.object({
   hasPendingUserInput: z.boolean(),
   lastError: z.string().nullable(),
   lastAssistantMessage: z.string().nullable(),
+  pendingRequests: z.array(pendingRequestSchema),
 });
 
 /** Output schema of t3_wait. Mirrors WaitResult in wait.ts. */
@@ -561,14 +591,15 @@ const waitInputShape = {
     .describe("Longest block for waitUntil, in milliseconds. Default 600000. Keep it below the client's tool timeout."),
 };
 
-/** Fill each ready thread's last assistant message from its detail snapshot. */
+/** Fill each ready thread's last assistant message and open requests from its detail snapshot. */
 async function withMessages(client: T3Client, result: WaitResult): Promise<WaitResult> {
   await Promise.all(
     result.ready.map(async (state) => {
       if (state.reason === "not-found") return;
       try {
-        state.lastAssistantMessage = threadDetail(await client.getThreadSnapshot(state.threadId), 0, 0)
-          .lastAssistantMessage;
+        const snapshot = await client.getThreadSnapshot(state.threadId);
+        state.lastAssistantMessage = threadDetail(snapshot, 0, 0).lastAssistantMessage;
+        state.pendingRequests = openRequests(snapshot.thread.activities ?? []);
       } catch {
         // The wait result stays useful without the message.
       }
@@ -666,7 +697,8 @@ export function registerTools(
         "and returns immediately without waiting for new events. structuredContent " +
         "keeps the full message text and gives lastAssistantMessage. nativeSession " +
         "gives the provider's own session ID (Claude session, Codex thread, OpenCode " +
-        "session) from T3's local state, or null when unavailable.",
+        "session) from T3's local state, or null when unavailable. pendingRequests " +
+        "lists open approval and user-input requests for t3_respond.",
       outputSchema: threadWithSessionOutputSchema,
       inputSchema: {
         threadId: z.string().min(1).describe("T3 Code thread ID (from t3_list_threads or t3_send_prompt)"),
@@ -693,6 +725,7 @@ export function registerTools(
         return structuredResult({
           ...threadDetail(snapshot, messageLimit ?? 10, activityLimit ?? 10),
           nativeSession,
+          pendingRequests: openRequests(snapshot.thread.activities ?? []),
         });
       } catch (error) {
         return errorResult(error);
@@ -1118,6 +1151,72 @@ export function registerTools(
           onProgress: (ms) => context.progress?.(ms, `waiting on ${threadIds.length} thread(s)`),
         });
         return structuredResult(await withMessages(client, result));
+      } catch (error) {
+        return errorResult(error);
+      }
+    },
+  );
+
+  registerTool(
+    "t3_respond",
+    {
+      description:
+        "Answer an open request of a thread: approve or decline a permission request " +
+        "(decision), answer its questions (answers keyed by question id), or dismiss a " +
+        "question (dismiss=true). Find requestId, the offered decisions, and the " +
+        "questions in pendingRequests of t3_wait or t3_get_thread. Refuses a request " +
+        "that is no longer open or a decision the provider did not offer. Returns a " +
+        "dispatch acknowledgement.",
+      outputSchema: respondOutputSchema,
+      inputSchema: {
+        threadId: z.string().min(1).describe("Thread that owns the request"),
+        requestId: z.string().min(1).describe("requestId from pendingRequests"),
+        decision: z
+          .enum(APPROVAL_DECISIONS)
+          .optional()
+          .describe(
+            "For an approval: accept (this request only), acceptForSession, acceptAlways " +
+              "(persists in the provider's config), decline, or cancel",
+          ),
+        answers: z
+          .record(z.string(), z.unknown())
+          .optional()
+          .describe("For a question: answers keyed by question id; use an option label, or free text when allowed"),
+        dismiss: z.boolean().optional().describe("For a question: dismiss it without answering"),
+      },
+    },
+    async ({ threadId, requestId, decision, answers, dismiss }) => {
+      try {
+        const snapshot = await client.getThreadSnapshot(threadId);
+        const request = openRequests(snapshot.thread.activities ?? []).find((open) => open.requestId === requestId);
+        if (!request) throw new Error(`Request ${requestId} is not open on thread ${threadId}`);
+        const base = { commandId: commandId(), threadId, requestId, createdAt: now() };
+
+        if (request.kind === "approval") {
+          if (!decision) throw new Error("An approval request needs a decision");
+          if (answers || dismiss) throw new Error("answers and dismiss apply to questions, not approvals");
+          if (!request.decisions.includes(decision)) {
+            throw new Error(`Decision ${decision} is not offered; choose one of ${request.decisions.join(", ")}`);
+          }
+          const action = "thread.approval.respond" as const;
+          const result = await client.dispatchCommand({ type: action, ...base, decision });
+          return structuredResult({ threadId, requestId, action, decision, sequence: result.sequence });
+        }
+
+        if (decision) throw new Error("A question needs answers or dismiss, not a decision");
+        if (dismiss) {
+          if (answers) throw new Error("Pass answers or dismiss, not both");
+          const action = "thread.user-input.dismiss" as const;
+          const result = await client.dispatchCommand({ type: action, ...base });
+          return structuredResult({ threadId, requestId, action, decision: null, sequence: result.sequence });
+        }
+        if (!answers || Object.keys(answers).length === 0) throw new Error("A question needs answers or dismiss");
+        const known = new Set(request.questions.map((question) => question.id));
+        const unknown = Object.keys(answers).filter((id) => known.size > 0 && !known.has(id));
+        if (unknown.length) throw new Error(`Unknown question id(s): ${unknown.join(", ")}`);
+        const action = "thread.user-input.respond" as const;
+        const result = await client.dispatchCommand({ type: action, ...base, answers });
+        return structuredResult({ threadId, requestId, action, decision: null, sequence: result.sequence });
       } catch (error) {
         return errorResult(error);
       }

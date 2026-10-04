@@ -18,7 +18,11 @@ const snapshot: T3ThreadDetailSnapshot = {
     latestTurn: null, createdAt: timestamp, updatedAt: timestamp,
     archivedAt: null, deletedAt: null, settledOverride: null, settledAt: null,
     messages: [{ id: "message-1", role: "assistant", text: longMessage, createdAt: timestamp }],
-    activities: [], session: null,
+    activities: [{ id: "activity-1", tone: "approval", kind: "approval.requested", summary: "Command approval requested",
+      turnId: null, createdAt: timestamp,
+      payload: { requestId: "req-1", requestKind: "command", detail: "npm test",
+        options: [{ decision: "accept", label: "Accept" }, { decision: "decline", label: "Decline" }] } }],
+    session: null,
   },
 };
 const project = { id: "project-1", title: "Project", workspaceRoot: "/srv/work/project", createdAt: timestamp, updatedAt: timestamp };
@@ -45,6 +49,7 @@ const calls: Array<[string, Record<string, unknown>]> = [
   ["t3_stop_session", { threadId: "thread-1" }],
   ["t3_settle_thread", { threadId: "thread-1" }],
   ["t3_wait", { threadIds: ["thread-1"], timeoutMs: 1000 }],
+  ["t3_respond", { threadId: "thread-1", requestId: "req-1", decision: "accept" }],
   ["t3_get_usage_limits", {}],
   ["t3_get_config", {}],
 ];

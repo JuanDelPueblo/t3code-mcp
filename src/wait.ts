@@ -7,6 +7,7 @@
  * level-triggered: a thread that already needs attention returns at once.
  */
 
+import type { PendingRequest } from "./requests.js";
 import type { T3Client, T3LatestTurn } from "./t3client.js";
 
 export type WaitUntil = "attention" | "turn-end";
@@ -94,6 +95,8 @@ export interface ThreadWaitState {
   hasPendingUserInput: boolean;
   lastError: string | null;
   lastAssistantMessage: string | null;
+  /** Open approval and user-input requests; filled for threads that need attention. */
+  pendingRequests: PendingRequest[];
 }
 
 export interface WaitResult {
@@ -139,6 +142,7 @@ function waitState(
     hasPendingUserInput: thread?.hasPendingUserInput ?? false,
     lastError: thread?.session?.lastError ?? null,
     lastAssistantMessage: null,
+    pendingRequests: [],
   };
 }
 

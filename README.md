@@ -12,6 +12,7 @@ T3 v0.0.44 and v0.0.45 and supports both local stdio clients and a long-running 
 - `t3_list_threads` — discover existing threads with their current state, including threads started from the T3 UI or another client
 - `t3_get_thread` — immediate current snapshot of one thread: state, latest turn, messages, activities, and the provider's native session
 - `t3_wait` — block until watched threads need attention (turn ended, approval or input requested, session error), without polling
+- `t3_respond` — answer an open approval (accept, decline, …) or question of a thread
 - `t3_rename_thread` — change an existing thread's title
 - `t3_send_prompt` — create a project/thread and start a coding turn
 - `t3_send_message` — start another turn on an existing thread, in the same provider session
@@ -147,6 +148,31 @@ cancels. Clients still apply their own tool timeout; set it above
 | Claude Code | `MCP_TOOL_TIMEOUT` environment variable, in milliseconds |
 | Codex CLI | `tool_timeout_sec` under `[mcp_servers.t3code]` (default 60) |
 | Hermes | `timeout` under `mcp_servers.t3code` |
+
+## Answering approvals and questions
+
+When a thread waits for a permission decision or asks a question, `t3_wait`
+and `t3_get_thread` list it in `pendingRequests`:
+
+- `requestId`, `kind` (`approval` or `user-input`), `summary`, `createdAt`
+- approvals: `detail` (the command or tool call) and the offered `decisions`
+- questions: `questions` with `id`, `question`, `options`, `allowCustomAnswer`
+
+`t3_respond` answers one request:
+
+```json
+{ "threadId": "…", "requestId": "…", "decision": "acceptForSession" }
+{ "threadId": "…", "requestId": "…", "answers": { "scope": "README.md" } }
+{ "threadId": "…", "requestId": "…", "dismiss": true }
+```
+
+Decisions are `accept` (this request), `acceptForSession`, `acceptAlways`
+(persists in the provider's own settings), `decline`, and `cancel`. The tool
+refuses a request that is no longer open, a decision the provider did not
+offer, and an unknown question ID. It dispatches T3's
+`thread.approval.respond`, `thread.user-input.respond`, or
+`thread.user-input.dismiss` command and returns its sequence. What an agent may
+approve is a policy question for the caller, not for this server.
 
 ## Native sessions
 

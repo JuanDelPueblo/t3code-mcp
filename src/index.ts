@@ -19,7 +19,7 @@ function createMcpServer(): McpServer {
   const server = new McpServer(
     {
       name: "t3code-mcp",
-      version: "0.4.0",
+      version: "0.5.0",
       description: "MCP server for orchestrating T3 Code",
     },
     {
@@ -44,6 +44,8 @@ function createMcpServer(): McpServer {
         "   in one call. A timeout status means call t3_wait again.",
         "   t3_get_thread and t3_get_status return an immediate snapshot;",
         "   t3_get_thread also reports the provider's native session ID.",
+        "   A ready thread may list pendingRequests (approvals or questions);",
+        "   answer them with t3_respond, within the caller's own rules.",
         "5. Call t3_send_message to start another turn on a settled thread; it",
         "   never creates a project, thread, branch, or worktree. Use it to wake",
         "   a worker thread or to send review findings back to the agent.",
