@@ -153,7 +153,7 @@ describe("collectUsageReport", () => {
         ["antigravity", "antigravity", "antigravity-cli", true],
       ]);
       expect(report.noUsageData).toEqual([]);
-      expect(() => z.object(usageReportOutputSchema).strict().parse(report)).not.toThrow();
+      expect(() => z.object(usageReportOutputSchema).strict().parse({ ...report, refreshed: [] })).not.toThrow();
       const openCode = report.providers.find((p) => p.provider === "opencode")!;
       expect(openCode.pools[0].models).toBe("opencode-go/*");
       expect(openCode.pools[0].windows.map((win) =>
@@ -221,7 +221,7 @@ describe("collectUsageReport", () => {
     expect(report.providers[2]).toMatchObject({ available: false, reason: "No usage windows reported", checkedAt });
     expect(report.providers[3].externalUsage).toEqual({ label: "Dashboard", url: "https://example.com/usage" });
     expect(report.noUsageData).toEqual(["missing"]);
-    expect(() => z.object(usageReportOutputSchema).strict().parse(report)).not.toThrow();
+    expect(() => z.object(usageReportOutputSchema).strict().parse({ ...report, refreshed: [] })).not.toThrow();
   });
 
   it("does not mark retained windows current after a failed native probe", () => {

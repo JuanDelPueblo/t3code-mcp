@@ -454,6 +454,11 @@ export class T3Client {
     return this.request("server.getConfig", {});
   }
 
+  /** Ask T3 to re-probe one provider; refreshModels also bypasses T3's caches. */
+  async refreshProvider(instanceId: string, refreshModels = false): Promise<unknown> {
+    return this.request("server.refreshProviders", refreshModels ? { instanceId, refreshModels: true } : { instanceId });
+  }
+
   async dispatchCommand(command: unknown): Promise<{ sequence: number }> {
     return this.request<{ sequence: number }>("orchestration.dispatchCommand", command);
   }

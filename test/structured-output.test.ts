@@ -71,6 +71,7 @@ describe("MCP structured output over a real client transport", () => {
   function makeUpstream() {
     return {
       getConfig: vi.fn(async () => config),
+      refreshProvider: vi.fn(async (_instanceId: string, _refreshModels: boolean) => undefined),
       getReadModel: vi.fn(async () => ({ projects: [project], threads: [snapshot.thread], snapshotSequence: 77, updatedAt: timestamp })),
       getThreadSnapshot: vi.fn(async (id: string) => ({ ...snapshot, thread: { ...snapshot.thread, id } })),
       dispatchCommand: vi.fn(async (_command: unknown) => ({ sequence: 78 })),

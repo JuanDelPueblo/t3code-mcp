@@ -18,6 +18,7 @@ import {
 import {
   collectUsageReport,
   formatUsageReport,
+  refreshStaleUsage,
   usageReportFromConfig,
   type T3UsageLimitSource,
   type UsageProbeOptions,
@@ -475,6 +476,13 @@ export const usageReportOutputSchema = {
     }),
   ),
   noUsageData: z.array(z.string()),
+  refreshed: z.array(z.object({
+    instanceId: z.string(),
+    method: z.enum(["status", "models"]),
+    ok: z.boolean(),
+    checkedAt: z.string().nullable(),
+    error: z.string().nullable(),
+  })),
 };
 
 /** Format the server config's provider usage limits into readable rows, with no probes. */
@@ -1325,15 +1333,30 @@ export function registerTools(
         "An optional Antigravity CLI probe fills missing data. Reports used and " +
         "remaining percent and the reset time " +
         "for each quota window (5h session, rolling, weekly, monthly). Models in " +
-        "one pool share its windows. structuredContent holds the same data as JSON.",
-      inputSchema: {},
+        "one pool share its windows. structuredContent holds the same data as JSON. " +
+        "By default it first asks T3 to refresh providers whose usage is older than " +
+        "maxAgeMs; refreshed reports each attempt. Check each provider's checkedAt.",
+      inputSchema: {
+        refresh: z.boolean().optional().describe("Refresh stale providers before reading. Default true."),
+        maxAgeMs: z
+          .number()
+          .int()
+          .min(0)
+          .max(86_400_000)
+          .optional()
+          .describe("Usage older than this is refreshed first. Default 300000 (5 minutes)."),
+      },
       outputSchema: usageReportOutputSchema,
     },
-    async () => {
+    async ({ refresh, maxAgeMs }) => {
       try {
-        const config = (await client.getConfig()) as T3UsageLimitSource;
+        let config = (await client.getConfig()) as T3UsageLimitSource;
+        let refreshed: Awaited<ReturnType<typeof refreshStaleUsage>>["refreshed"] = [];
+        if (refresh ?? true) {
+          ({ config, refreshed } = await refreshStaleUsage(client, config, { maxAgeMs: maxAgeMs ?? 300_000 }));
+        }
         const report = await collectUsageReport(config, usageOptions);
-        return structuredResult(report);
+        return structuredResult({ ...report, refreshed });
       } catch (error) {
         return errorResult(error);
       }

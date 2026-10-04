@@ -390,3 +390,79 @@ export function formatUsageReport(report: UsageReport, nowMs = Date.now()): stri
   if (lines.length === 0) return "(no usage limits reported)";
   return lines.join("\n");
 }
+
+/** One provider refresh attempted before a usage read. */
+export interface UsageRefresh {
+  instanceId: string;
+  /** status: a cheap status probe; models: T3's full rediscovery, which Claude needs. */
+  method: "status" | "models";
+  /** True when the provider's usage timestamp moved forward. */
+  ok: boolean;
+  checkedAt: string | null;
+  error: string | null;
+}
+
+export interface UsageRefreshClient {
+  getConfig(): Promise<unknown>;
+  refreshProvider(instanceId: string, refreshModels: boolean): Promise<unknown>;
+}
+
+function usageCheckedAt(config: T3UsageLimitSource, instanceId: string): string | null {
+  return config.providers?.find((p) => p.instanceId === instanceId)?.usageLimits?.checkedAt ?? null;
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) => setTimeout(() => reject(new Error(`no answer within ${ms} ms`)), ms).unref()),
+  ]);
+}
+
+/**
+ * Ask T3 to refresh providers whose usage snapshot is older than maxAgeMs.
+ * T3 updates usage only while a provider is in use, so an idle provider can
+ * report hours-old windows. A status refresh updates most providers; Claude
+ * reads usage from its agent initialization, so a provider whose timestamp
+ * did not move gets one full refresh (refreshModels). Failures never fail the
+ * read: the report then shows the older data with its checkedAt.
+ */
+export async function refreshStaleUsage(
+  client: UsageRefreshClient,
+  config: T3UsageLimitSource,
+  options: { maxAgeMs: number; timeoutMs?: number; nowMs?: number },
+): Promise<{ config: T3UsageLimitSource; refreshed: UsageRefresh[] }> {
+  const nowMs = options.nowMs ?? Date.now();
+  const timeoutMs = options.timeoutMs ?? 30_000;
+  const stale = (config.providers ?? []).filter((p) => {
+    if (!isActive(p) || !hasT3Usage(p) || !p.instanceId) return false;
+    const checked = Date.parse(p.usageLimits?.checkedAt ?? "");
+    return !Number.isFinite(checked) || nowMs - checked > options.maxAgeMs;
+  });
+  if (stale.length === 0) return { config, refreshed: [] };
+
+  const results = new Map<string, UsageRefresh>();
+  const attempt = async (instanceId: string, refreshModels: boolean) => {
+    try {
+      await withTimeout(client.refreshProvider(instanceId, refreshModels), timeoutMs);
+      return null;
+    } catch (error) {
+      return errorMessage(error);
+    }
+  };
+
+  let current = config;
+  for (const method of ["status", "models"] as const) {
+    const pending = stale
+      .map((p) => p.instanceId as string)
+      .filter((id) => !results.get(id)?.ok);
+    if (pending.length === 0) break;
+    const errors = await Promise.all(pending.map((id) => attempt(id, method === "models")));
+    current = (await client.getConfig()) as T3UsageLimitSource;
+    pending.forEach((id, index) => {
+      const before = usageCheckedAt(config, id);
+      const after = usageCheckedAt(current, id);
+      results.set(id, { instanceId: id, method, ok: after !== null && after !== before, checkedAt: after, error: errors[index] });
+    });
+  }
+  return { config: current, refreshed: [...results.values()] };
+}

@@ -219,6 +219,16 @@ t3_send_message(orchestratorThreadId, "WORKER_DONE ...")
 
 ## Usage limits
 
+T3 updates a provider's usage only while that provider is in use, so an idle
+provider can report windows that are hours old. By default,
+`t3_get_usage_limits` first asks T3 to refresh every provider whose usage is
+older than `maxAgeMs` (default 300000). It tries a status refresh, then, for a
+provider whose timestamp did not move (Claude reads usage at agent start), one
+full refresh with `refreshModels`. `refreshed` lists each attempt with
+`instanceId`, `method` (`status` or `models`), `ok`, `checkedAt`, and `error`.
+A failed refresh never fails the read; check each provider's `checkedAt`. Pass
+`refresh: false` to read T3's snapshot as is.
+
 `t3_get_usage_limits` returns this object as `structuredContent` and JSON text:
 
 ```json
