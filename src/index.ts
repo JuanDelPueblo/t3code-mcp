@@ -19,7 +19,7 @@ function createMcpServer(): McpServer {
   const server = new McpServer(
     {
       name: "t3code-mcp",
-      version: "0.6.1",
+      version: "0.7.0",
       description: "MCP server for orchestrating T3 Code",
     },
     {
@@ -29,7 +29,7 @@ function createMcpServer(): McpServer {
         "Use T3 Code as a coding-agent orchestrator.",
         "Every tool returns structuredContent with a matching JSON text block.",
         "Errors have isError=true and structuredContent.error.message.",
-        "1. Call t3_get_config; its config.providers lists instance IDs and models.",
+        "1. Call t3_get_config with view \"providers\" for instance IDs, models, and options.",
         "2. Call t3_list_threads to discover existing threads, including threads",
         "   started from the T3 UI or another client.",
         "3. Call t3_send_prompt with an instanceId, model, and project/workspace.",

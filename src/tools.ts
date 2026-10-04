@@ -548,6 +548,38 @@ export const configOutputSchema = {
   config: z.record(z.unknown()),
 };
 
+/** The dispatch-relevant part of server.getConfig providers: IDs, status, models, option values. */
+export function compactProviders(config: Record<string, unknown>): Array<Record<string, unknown>> {
+  const providers = Array.isArray(config.providers) ? (config.providers as Array<Record<string, unknown>>) : [];
+  return providers.map((provider) => ({
+    instanceId: provider.instanceId ?? null,
+    driver: provider.driver ?? null,
+    displayName: provider.displayName ?? null,
+    enabled: provider.enabled ?? null,
+    status: provider.status ?? null,
+    models: (Array.isArray(provider.models) ? (provider.models as Array<Record<string, unknown>>) : []).map((model) => {
+      const capabilities = (model.capabilities ?? {}) as Record<string, unknown>;
+      const descriptors = Array.isArray(capabilities.optionDescriptors)
+        ? (capabilities.optionDescriptors as Array<Record<string, unknown>>)
+        : [];
+      return {
+        slug: model.slug ?? null,
+        name: model.name ?? null,
+        options: descriptors.map((descriptor) => {
+          const values = Array.isArray(descriptor.options) ? (descriptor.options as Array<Record<string, unknown>>) : [];
+          const fallback = values.find((value) => value.isDefault)?.id ?? null;
+          return {
+            id: descriptor.id ?? null,
+            type: descriptor.type ?? null,
+            values: values.map((value) => value.id),
+            default: descriptor.currentValue ?? fallback,
+          };
+        }),
+      };
+    }),
+  }));
+}
+
 /** Structured state after a turn start, for t3_send_prompt and t3_send_message. */
 function turnStarted(
   threadId: string,
@@ -1367,13 +1399,27 @@ export function registerTools(
     "t3_get_config",
     {
       description: "Retrieve T3 Code server configuration, including provider instances and models. " +
-        "The config field preserves all server-provided fields.",
-      inputSchema: {},
+        "view=full (default) preserves all server-provided fields (large). view=providers " +
+        "returns only what dispatch needs: each provider's instanceId, status, and models " +
+        "with their option IDs and allowed values. instanceIds limits the providers.",
+      inputSchema: {
+        view: z.enum(["full", "providers"]).optional().describe("full (default) or providers (compact)"),
+        instanceIds: z.array(z.string().min(1)).optional().describe("Only these provider instances"),
+      },
       outputSchema: configOutputSchema,
     },
-    async () => {
+    async ({ view, instanceIds }) => {
       try {
-        return structuredResult({ config: z.record(z.unknown()).parse(await client.getConfig()) });
+        const config = z.record(z.unknown()).parse(await client.getConfig());
+        const wanted = (provider: Record<string, unknown>) =>
+          !instanceIds || instanceIds.includes(String(provider.instanceId));
+        if ((view ?? "full") === "providers") {
+          return structuredResult({ config: { providers: compactProviders(config).filter(wanted) } });
+        }
+        if (instanceIds && Array.isArray(config.providers)) {
+          config.providers = (config.providers as Array<Record<string, unknown>>).filter(wanted);
+        }
+        return structuredResult({ config });
       } catch (error) {
         return errorResult(error);
       }

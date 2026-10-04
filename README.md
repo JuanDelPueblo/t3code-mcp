@@ -7,7 +7,7 @@ T3 v0.0.44 and v0.0.45 and supports both local stdio clients and a long-running 
 
 ## MCP tools
 
-- `t3_get_config` — inspect configured provider instances and model catalogs under `config.providers`
+- `t3_get_config` — inspect configured provider instances and model catalogs under `config.providers`; `view: "providers"` returns a compact dispatch view (instance, status, model slugs, option IDs and values), optionally limited by `instanceIds`
 - `t3_get_usage_limits` — native T3 subscription usage, including OpenCode Go; optional Antigravity CLI fallback
 - `t3_list_threads` — discover existing threads with their current state, including threads started from the T3 UI or another client
 - `t3_get_thread` — immediate current snapshot of one thread: state, latest turn, messages, activities, and the provider's native session

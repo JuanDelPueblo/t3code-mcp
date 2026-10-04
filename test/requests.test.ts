@@ -77,3 +77,30 @@ describe("t3_respond", () => {
     expect(dispatched[0].answers).toEqual({ scope: "README.md" });
   });
 });
+
+describe("t3_get_config compact view", () => {
+  it("returns only dispatch fields, filtered by instance", async () => {
+    const config = {
+      keybindings: [{ big: true }],
+      providers: [
+        { instanceId: "codex", driver: "codex", displayName: "Codex", enabled: true, status: "ready", skills: ["x"],
+          models: [{ slug: "gpt-6-luna", name: "GPT-6 Luna", isCustom: false, capabilities: { optionDescriptors: [
+            { id: "reasoningEffort", type: "select", label: "Reasoning", currentValue: "low",
+              options: [{ id: "low", label: "Low", isDefault: true }, { id: "high", label: "High" }] }] } }] },
+        { instanceId: "opencode", driver: "opencode", enabled: true, status: "ready", models: [] },
+      ],
+    };
+    const registered = new Map<string, (args: Record<string, unknown>) => Promise<Record<string, unknown>>>();
+    registerTools({ registerTool: (name: string, _c: unknown, handler: never) => registered.set(name, handler),
+      server: { setRequestHandler: vi.fn() } } as never, { getConfig: vi.fn(async () => config) } as never,
+      { antigravityCli: null, timeoutMs: 1000 });
+    const result = await registered.get("t3_get_config")!({ view: "providers", instanceIds: ["codex"] });
+    expect(result.structuredContent).toEqual({ config: { providers: [{
+      instanceId: "codex", driver: "codex", displayName: "Codex", enabled: true, status: "ready",
+      models: [{ slug: "gpt-6-luna", name: "GPT-6 Luna",
+        options: [{ id: "reasoningEffort", type: "select", values: ["low", "high"], default: "low" }] }],
+    }] } });
+    const full = await registered.get("t3_get_config")!({});
+    expect((full.structuredContent as { config: Record<string, unknown> }).config.keybindings).toBeDefined();
+  });
+});
