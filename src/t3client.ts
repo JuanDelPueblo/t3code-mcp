@@ -18,6 +18,7 @@ import type { AccessTokenProvider } from "./auth.js";
 export interface T3ClientConfig {
   baseUrl: string;
   accessTokenProvider: AccessTokenProvider;
+  limits?: Partial<T3ConnectionLimits>;
 }
 
 export interface T3LatestTurn {
@@ -111,6 +112,26 @@ interface RpcInterrupt {
   requestId: string;
 }
 
+interface RpcPing {
+  _tag: "Ping";
+}
+
+/** Limits that keep a stalled T3 connection from hanging every tool. */
+export interface T3ConnectionLimits {
+  /** Longest wait for a WebSocket ticket, an HTTP read, or the socket to open. */
+  connectTimeoutMs: number;
+  /** How often to ping T3 over the RPC socket. */
+  pingIntervalMs: number;
+  /** A socket with no Pong for this long is treated as dead and closed. */
+  pongTimeoutMs: number;
+}
+
+const DEFAULT_LIMITS: T3ConnectionLimits = {
+  connectTimeoutMs: 15_000,
+  pingIntervalMs: 20_000,
+  pongTimeoutMs: 60_000,
+};
+
 interface RpcExitSuccess {
   _tag: "Exit";
   requestId: string;
@@ -171,8 +192,13 @@ export class T3Client {
   private pending = new Map<string, PendingRequest>();
   private connectPromise: Promise<void> | null = null;
   private closing = false;
+  private pingTimer: NodeJS.Timeout | null = null;
+  private lastPongAt = 0;
+  private readonly limits: T3ConnectionLimits;
 
-  constructor(private readonly config: T3ClientConfig) {}
+  constructor(private readonly config: T3ClientConfig) {
+    this.limits = { ...DEFAULT_LIMITS, ...config.limits };
+  }
 
   private get httpBase(): string {
     return new URL(this.config.baseUrl.replace(/^ws/, "http")).origin;
@@ -186,6 +212,7 @@ export class T3Client {
     const response = await fetch(`${this.httpBase}/api/auth/websocket-ticket`, {
       method: "POST",
       headers: { Authorization: `Bearer ${accessToken}` },
+      signal: AbortSignal.timeout(this.limits.connectTimeoutMs),
     });
 
     if (!response.ok) {
@@ -216,6 +243,7 @@ export class T3Client {
 
     const response = await fetch(url, {
       headers: { Authorization: `Bearer ${accessToken}` },
+      signal: AbortSignal.timeout(Math.max(this.limits.connectTimeoutMs, 30_000)),
     });
 
     if (!response.ok) {
@@ -305,12 +333,20 @@ export class T3Client {
           this.ws = ws;
 
           const failOpen = (error: Error) => {
+            clearTimeout(openTimer);
             this.ws = null;
             reject(error);
           };
+          // A socket that never opens must not hang every caller.
+          const openTimer = setTimeout(() => {
+            ws.terminate();
+            failOpen(new Error(`T3 Code WebSocket did not open within ${this.limits.connectTimeoutMs} ms`));
+          }, this.limits.connectTimeoutMs);
 
           ws.once("open", () => {
+            clearTimeout(openTimer);
             ws.off("error", failOpen);
+            this.startKeepalive(ws);
             resolve();
           });
           ws.once("error", failOpen);
@@ -326,6 +362,8 @@ export class T3Client {
           });
 
           ws.on("close", () => {
+            if (this.ws === ws) this.stopKeepalive();
+            if (this.ws !== ws) return;
             this.ws = null;
             if (!this.closing) {
               const error = new Error("T3 Code WebSocket closed unexpectedly");
@@ -342,8 +380,39 @@ export class T3Client {
     return this.connectPromise;
   }
 
+  /**
+   * T3 never pings its clients, so a silently dead socket would leave streams
+   * waiting forever. Ping it; a socket that stops answering is closed, which
+   * rejects its requests so callers can reconnect.
+   */
+  private startKeepalive(ws: WebSocket): void {
+    this.stopKeepalive();
+    this.lastPongAt = Date.now();
+    this.pingTimer = setInterval(() => {
+      if (Date.now() - this.lastPongAt > this.limits.pongTimeoutMs) {
+        process.stderr.write("T3 Code WebSocket stopped answering pings; reconnecting\n");
+        ws.terminate();
+        return;
+      }
+      try {
+        ws.send(JSON.stringify({ _tag: "Ping" } satisfies RpcPing));
+      } catch {
+        // The close handler cleans up.
+      }
+    }, this.limits.pingIntervalMs);
+    this.pingTimer.unref();
+  }
+
+  private stopKeepalive(): void {
+    if (this.pingTimer) clearInterval(this.pingTimer);
+    this.pingTimer = null;
+  }
+
   private handleMessage(msg: RpcMessage): void {
-    if (msg._tag === "Pong") return;
+    if (msg._tag === "Pong") {
+      this.lastPongAt = Date.now();
+      return;
+    }
 
     if (msg._tag === "Defect" || msg._tag === "ClientProtocolError") {
       const detail = msg._tag === "Defect" ? msg.defect : msg.error;
@@ -404,7 +473,23 @@ export class T3Client {
     onChunk: (value: T) => void,
     signal?: AbortSignal,
   ): Promise<void> {
-    await this.connect();
+    if (signal?.aborted) return;
+    // Honor cancellation while connecting, too: a stalled connect must not
+    // keep a caller past its own deadline.
+    if (signal) {
+      let onAbort: () => void = () => undefined;
+      const aborted = new Promise<"aborted">((resolve) => {
+        onAbort = () => resolve("aborted");
+        signal.addEventListener("abort", onAbort, { once: true });
+      });
+      try {
+        if ((await Promise.race([this.connect().then(() => "connected" as const), aborted])) === "aborted") return;
+      } finally {
+        signal.removeEventListener("abort", onAbort);
+      }
+    } else {
+      await this.connect();
+    }
     const id = randomUUID();
 
     return new Promise<void>((resolve, reject) => {
@@ -442,6 +527,7 @@ export class T3Client {
 
   close(): void {
     this.closing = true;
+    this.stopKeepalive();
     this.ws?.close();
     this.ws = null;
 

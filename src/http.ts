@@ -190,6 +190,9 @@ export async function serveStreamableHttp(
 
     await new Promise<void>((resolve, reject) => {
       httpServer.close((error) => (error ? reject(error) : resolve()));
+      // Close kept-alive sockets now, so clients open a new connection to the
+      // next server instead of writing into one that is shutting down.
+      httpServer.closeAllConnections();
     });
   };
 }

@@ -18,8 +18,8 @@ function createServer(): McpServer {
   return server;
 }
 
-async function start(): Promise<void> {
-  close = await serveStreamableHttp(createServer, { host: "127.0.0.1", port, path: "/mcp" });
+async function start(onPort = port): Promise<void> {
+  close = await serveStreamableHttp(createServer, { host: "127.0.0.1", port: onPort, path: "/mcp" });
 }
 
 afterEach(async () => {
@@ -38,6 +38,8 @@ describe("Streamable HTTP sessions", () => {
 
     await close!();
     await start();
+    // Let the client see its old socket close, as it does when a process exits.
+    await new Promise((resolve) => setTimeout(resolve, 50));
 
     // The client still sends its old session ID; the server answers statelessly.
     expect((await client.callTool({ name: "echo", arguments: { text: "after" } })).content).toEqual([
@@ -48,7 +50,9 @@ describe("Streamable HTTP sessions", () => {
   });
 
   it("answers 404 to a stream or delete for an unknown session, and 400 without a session", async () => {
-    await start();
+    // A separate port: fetch would reuse a pooled connection to the closed server.
+    await start(port + 1);
+    const url = `http://127.0.0.1:${port + 1}/mcp`;
     const stream = await fetch(url, { method: "GET", headers: { ...headers, "mcp-session-id": "gone" } });
     expect(stream.status).toBe(404);
     const missing = await fetch(url, {

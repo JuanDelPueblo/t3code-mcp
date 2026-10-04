@@ -208,8 +208,13 @@ export async function waitForThreads(
       options.signal?.addEventListener("abort", onCancel, { once: true });
 
       synced = false;
+      // The deadline holds even if the stream call never settles.
+      const stopped = new Promise<void>((resolve) => {
+        if (controller.signal.aborted) resolve();
+        else controller.signal.addEventListener("abort", () => resolve(), { once: true });
+      });
       try {
-        await client.subscribeShell((item) => {
+        await Promise.race([stopped, client.subscribeShell((item) => {
           const value = record(item);
           if (!value) return;
           if (value.kind === "snapshot") {
@@ -238,7 +243,7 @@ export async function waitForThreads(
             outcome ??= "ready";
             controller.abort();
           }
-        }, controller.signal);
+        }, controller.signal)]);
       } catch (error) {
         lastError = error;
         failures += 1;
