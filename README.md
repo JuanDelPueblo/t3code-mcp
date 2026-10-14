@@ -17,6 +17,7 @@ T3 v0.0.44 and v0.0.45 and supports both local stdio clients and a long-running 
 - `t3_send_prompt` — create a project/thread and start a coding turn
 - `t3_send_message` — start another turn on an existing thread, in the same provider session
 - `t3_get_status` — immediate thread snapshot plus optional live event tail
+- `t3_compact_thread` — compact an idle thread's context, optionally only when it is nearly full
 - `t3_interrupt` — interrupt a running turn
 - `t3_stop_session` — stop a provider session
 - `t3_settle_thread` — mark a thread settled, or active again with `settled: false`
@@ -38,10 +39,11 @@ Message and event text stays complete.
 | --- | --- |
 | `t3_get_config` | `config`, preserving the complete server configuration and model catalogs |
 | `t3_list_threads` | `projects`, `threads` |
-| `t3_get_thread` | Thread summary, snapshot sequence, messages, activities, `lastAssistantMessage` |
+| `t3_get_thread` | Thread summary, snapshot sequence, messages, activities, `lastAssistantMessage`, `context` |
 | `t3_get_status` | Same detail fields as `t3_get_thread`, plus `events`, `waitMs` |
 | `t3_send_prompt`, `t3_send_message` | Thread/project IDs, placement, turn/session state, `sequence`, `events`, `snapshotAvailable`, `snapshotSequence` |
 | `t3_rename_thread` | `threadId`, `title`, `previousTitle`, `sequence` |
+| `t3_compact_thread` | `threadId`, `status`, `reason`, `sequence`, `before`, `after`, `compaction` |
 | `t3_interrupt`, `t3_stop_session`, `t3_settle_thread` | `threadId`, `action` (T3 command type), `sequence` |
 | `t3_get_usage_limits` | `checkedAt`, normalized `providers`, `noUsageData` |
 
@@ -220,6 +222,49 @@ t3_send_message(workerThreadId, "...", waitUntil: "attention") → revise and wa
 
 t3_send_message(orchestratorThreadId, "WORKER_DONE ...")
 → wake an existing orchestrator thread
+```
+
+## Context window and compaction
+
+`t3_get_thread`, `t3_get_status`, the ready threads of `t3_wait`, and the
+results of `t3_send_prompt` and `t3_send_message` include `context`: the
+thread's latest context-window usage as the provider reported it to T3.
+
+```json
+{
+  "usedTokens": 143208, "maxTokens": 258400, "usedPercent": 55.4,
+  "remainingTokens": 115192, "compactsAutomatically": true,
+  "autoCompactThreshold": null, "updatedAt": "2026-10-04T18:13:47.937Z",
+  "lastCompaction": { "at": "…", "beforeTokens": 18494, "afterTokens": 4591 }
+}
+```
+
+`context` is null for a provider that reports no usage (OpenCode today), and
+`maxTokens`, `usedPercent`, and `remainingTokens` are null when the provider
+reports no window size. After a compaction, `usedTokens` is the compacted size.
+`t3_list_threads` omits `context`, because T3's thread list carries no usage.
+
+`t3_compact_thread` compacts an idle thread. T3 has the provider summarize the
+conversation (Claude, Cursor, Grok, and Antigravity through their compaction
+command; Codex and OpenCode natively), and the agent continues in the same
+session with the summary. The tool refuses a thread with a running turn.
+
+- `minUsedPercent` compacts only a thread whose context is at least that full,
+  and returns `status: "skipped"` with the reason otherwise. A thread whose
+  provider reports no window size is skipped.
+- The call waits for the compaction (`waitTimeoutMs`, default 600000) and
+  returns `status: "compacted"` with `before` and `after` context and the
+  provider's own `compaction` token counts, or `failed` with T3's reason.
+  When the provider declines (for example a conversation too short to
+  compact), `compaction` has null token counts and `reason` gives its reply.
+- `wait: false` returns `status: "started"` at once; wait for several
+  compactions together with `t3_wait`.
+
+A coordinator can compact a long-running worker before its next follow-up:
+
+```text
+t3_compact_thread(workerThreadId, minUsedPercent: 60)
+t3_send_message(workerThreadId, "Fix these review findings: …", waitUntil: "attention")
 ```
 
 ## Usage limits

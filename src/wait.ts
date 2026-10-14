@@ -7,6 +7,7 @@
  * level-triggered: a thread that already needs attention returns at once.
  */
 
+import type { ContextWindow } from "./context.js";
 import type { PendingRequest } from "./requests.js";
 import type { T3Client, T3LatestTurn } from "./t3client.js";
 
@@ -96,6 +97,8 @@ export interface ThreadWaitState {
   lastAssistantMessage: string | null;
   /** Open approval and user-input requests; filled for threads that need attention. */
   pendingRequests: PendingRequest[];
+  /** Context-window usage; filled for threads that need attention. */
+  context: ContextWindow | null;
 }
 
 export interface WaitResult {
@@ -166,6 +169,7 @@ function waitState(
     lastError: thread?.session?.lastError ?? null,
     lastAssistantMessage: null,
     pendingRequests: [],
+    context: null,
   };
 }
 

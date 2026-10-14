@@ -6,10 +6,12 @@ import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { CallToolRequestSchema, type CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import { contextWindow, type ContextCompaction, type ContextWindow } from "./context.js";
 import type { NativeSessionLookup } from "./native-session.js";
 import { APPROVAL_DECISIONS, openRequests } from "./requests.js";
 import {
   T3Client,
+  type T3Activity,
   type T3Project,
   type T3ReadModel,
   type T3Thread,
@@ -209,6 +211,8 @@ export interface ThreadDetail extends ThreadSummary {
   messages: Array<{ id: string; role: string; text: string; createdAt: string }>;
   activityCount: number;
   activities: Array<{ kind: string; tone: string; summary: string; createdAt: string }>;
+  /** Latest context-window usage, or null when the provider reports none. */
+  context: ContextWindow | null;
 }
 
 /** Structured thread detail. Messages keep their full text. */
@@ -245,6 +249,7 @@ export function threadDetail(
       summary: activity.summary ?? "",
       createdAt: activity.createdAt,
     })),
+    context: contextWindow(activities),
   };
 }
 
@@ -304,6 +309,21 @@ export function formatThreadDetail(
   return parts.join("\n");
 }
 
+const contextWindowSchema = z
+  .object({
+    usedTokens: z.number(),
+    maxTokens: z.number().nullable(),
+    usedPercent: z.number().nullable(),
+    remainingTokens: z.number().nullable(),
+    compactsAutomatically: z.boolean().nullable(),
+    autoCompactThreshold: z.number().nullable(),
+    updatedAt: z.string(),
+    lastCompaction: z
+      .object({ at: z.string(), beforeTokens: z.number().nullable(), afterTokens: z.number().nullable() })
+      .nullable(),
+  })
+  .nullable();
+
 const threadSummaryShape = {
   id: z.string(),
   title: z.string(),
@@ -341,6 +361,7 @@ export const threadDetailOutputSchema = {
   messages: z.array(z.object({ id: z.string(), role: z.string(), text: z.string(), createdAt: z.string() })),
   activityCount: z.number(),
   activities: z.array(z.object({ kind: z.string(), tone: z.string(), summary: z.string(), createdAt: z.string() })),
+  context: contextWindowSchema,
 };
 
 const pendingRequestSchema = z.object({
@@ -402,6 +423,7 @@ const threadWaitStateSchema = z.object({
   lastError: z.string().nullable(),
   lastAssistantMessage: z.string().nullable(),
   pendingRequests: z.array(pendingRequestSchema),
+  context: contextWindowSchema,
 });
 
 /** Output schema of t3_wait. Mirrors WaitResult in wait.ts. */
@@ -429,8 +451,57 @@ export const turnStartedOutputSchema = {
   sessionStatus: z.string(),
   settled: z.boolean(),
   lastAssistantMessage: z.string().nullable(),
+  context: contextWindowSchema,
   wait: z.object(waitOutputSchema).optional(),
 };
+
+/** Output schema of t3_compact_thread. */
+export const compactOutputSchema = {
+  threadId: z.string(),
+  status: z.enum(["compacted", "started", "skipped", "failed", "timeout"]),
+  reason: z.string().nullable(),
+  sequence: z.number().int().nonnegative().nullable(),
+  before: contextWindowSchema,
+  after: contextWindowSchema,
+  compaction: z
+    .object({ at: z.string(), beforeTokens: z.number().nullable(), afterTokens: z.number().nullable() })
+    .nullable(),
+};
+
+/** The message T3 turns into a compaction for every provider. */
+export const COMPACT_COMMAND = "/compact";
+/** Re-reads allowed for T3 to record the compaction after the turn ends. */
+const COMPACTION_SETTLE_TRIES = 10;
+const COMPACTION_SETTLE_MS = 500;
+
+/**
+ * How the compaction requested by message `messageId` ended, if it has: T3
+ * tags both its compaction row and its failure row with the message ID.
+ */
+export function compactionEnd(
+  activities: readonly T3Activity[],
+  messageId: string,
+): { compaction?: ContextCompaction; failure?: string } | null {
+  for (const activity of [...activities].reverse()) {
+    const payload = (activity.payload ?? {}) as Record<string, unknown>;
+    if (payload.requestId !== messageId) continue;
+    if (activity.kind === "context-compaction") {
+      const tokens = (value: unknown) => (typeof value === "number" ? value : null);
+      return {
+        compaction: {
+          at: activity.createdAt,
+          beforeTokens: tokens(payload.beforeTokens),
+          afterTokens: tokens(payload.afterTokens),
+        },
+      };
+    }
+    if (activity.kind === "provider.turn.start.failed") {
+      const detail = typeof payload.detail === "string" ? payload.detail : null;
+      return { failure: detail ? `${activity.summary}: ${detail}` : activity.summary };
+    }
+  }
+  return null;
+}
 
 export const threadRenamedOutputSchema = {
   threadId: z.string(),
@@ -603,6 +674,7 @@ function turnStarted(
     sessionStatus: detail?.sessionStatus ?? "unknown",
     settled: detail?.settled ?? false,
     lastAssistantMessage: detail?.lastAssistantMessage ?? null,
+    context: detail?.context ?? null,
     ...(wait ? { wait } : {}),
   };
 }
@@ -631,14 +703,16 @@ const waitInputShape = {
     .describe("Longest block for waitUntil, in milliseconds. Default 600000. Keep it below the client's tool timeout."),
 };
 
-/** Fill each ready thread's last assistant message and open requests from its detail snapshot. */
+/** Fill each ready thread's last assistant message, open requests, and context from its detail snapshot. */
 async function withMessages(client: T3Client, result: WaitResult): Promise<WaitResult> {
   await Promise.all(
     result.ready.map(async (state) => {
       if (state.reason === "not-found") return;
       try {
         const snapshot = await client.getThreadSnapshot(state.threadId);
-        state.lastAssistantMessage = threadDetail(snapshot, 0, 0).lastAssistantMessage;
+        const detail = threadDetail(snapshot, 0, 0);
+        state.lastAssistantMessage = detail.lastAssistantMessage;
+        state.context = detail.context;
         state.pendingRequests = openRequests(snapshot.thread.activities ?? []);
       } catch {
         // The wait result stays useful without the message.
@@ -1150,6 +1224,120 @@ export function registerTools(
         }
 
         return structuredResult(turnStarted(threadId, thread.projectId, after, result.sequence, events, wait));
+      } catch (error) {
+        return errorResult(error);
+      }
+    },
+  );
+
+  registerTool(
+    "t3_compact_thread",
+    {
+      description:
+        "Compact an idle thread's context: T3 has the provider summarize the conversation " +
+        "(/compact, or the provider's native compaction) so the agent keeps working in the " +
+        "same session with a smaller context. Pass minUsedPercent to compact only a thread " +
+        "at least that full, for example before sending a follow-up to a long-running worker. " +
+        "Waits for the compaction by default; pass wait=false and t3_wait on the thread " +
+        "to compact several threads at once. structuredContent gives the context before and " +
+        "after, and the provider's own before/after token counts. Fails when a turn is running.",
+      outputSchema: compactOutputSchema,
+      inputSchema: {
+        threadId: z.string().min(1).describe("Thread ID from t3_send_prompt or t3_list_threads"),
+        minUsedPercent: z
+          .number()
+          .min(0)
+          .max(100)
+          .optional()
+          .describe(
+            "Compact only when the context is at least this percent full. A thread whose " +
+              "provider reports no window size is skipped. Omit to compact unconditionally.",
+          ),
+        wait: z.boolean().optional().describe("Wait until the compaction ends. Default true."),
+        waitTimeoutMs: z
+          .number()
+          .int()
+          .min(1000)
+          .max(MAX_WAIT_MS)
+          .optional()
+          .describe("Longest wait, in milliseconds. Default 600000. Keep it below the client's tool timeout."),
+      },
+    },
+    async ({ threadId, minUsedPercent, wait, waitTimeoutMs }, context) => {
+      try {
+        const snapshot = await client.getThreadSnapshot(threadId);
+        const thread = snapshot.thread;
+        const before = contextWindow(thread.activities ?? []);
+        const outcome = (
+          status: "compacted" | "started" | "skipped" | "failed" | "timeout",
+          fields: { sequence?: number; after?: ContextWindow | null; compaction?: ContextCompaction | null; reason?: string },
+        ) =>
+          structuredResult({
+            threadId,
+            status,
+            reason: fields.reason ?? null,
+            sequence: fields.sequence ?? null,
+            before,
+            after: fields.after ?? null,
+            compaction: fields.compaction ?? null,
+          });
+
+        if (thread.deletedAt !== null) throw new Error(`Thread ${threadId} is deleted`);
+        if (thread.latestTurn?.state === "running") {
+          throw new Error(
+            `Thread ${threadId} has a running turn (${thread.latestTurn.turnId}). ` +
+              "Wait for it to finish, or call t3_interrupt first.",
+          );
+        }
+        // T3 refuses to compact an empty conversation, and its refusal starts no turn.
+        if (!(thread.messages ?? []).some((message) => message.role === "user")) {
+          return outcome("skipped", { reason: "The thread has no conversation to compact." });
+        }
+        if (minUsedPercent !== undefined) {
+          if (before?.usedPercent == null) {
+            return outcome("skipped", { reason: "The provider reports no context window size for this thread." });
+          }
+          if (before.usedPercent < minUsedPercent) {
+            return outcome("skipped", {
+              reason: `The context is ${before.usedPercent}% full, below minUsedPercent ${minUsedPercent}.`,
+            });
+          }
+        }
+
+        const messageId = randomUUID();
+        const result = await client.dispatchCommand(
+          followUpTurnCommand(thread, COMPACT_COMMAND, { commandId: commandId(), messageId, createdAt: now() }),
+        );
+        if (wait === false) return outcome("started", { sequence: result.sequence });
+
+        const waited = await waitAfterDispatch(client, context, threadId, result.sequence, "turn-end", waitTimeoutMs);
+        // T3 can append the compaction row just after the turn ends, so allow it a moment.
+        let after = await client.getThreadSnapshot(threadId);
+        let ended = compactionEnd(after.thread.activities ?? [], messageId);
+        for (let tries = 0; !ended && waited.status === "ready" && tries < COMPACTION_SETTLE_TRIES; tries += 1) {
+          await new Promise((resolve) => setTimeout(resolve, COMPACTION_SETTLE_MS));
+          after = await client.getThreadSnapshot(threadId);
+          ended = compactionEnd(after.thread.activities ?? [], messageId);
+        }
+        const fields = { sequence: result.sequence, after: contextWindow(after.thread.activities ?? []) };
+        if (ended?.failure) return outcome("failed", { ...fields, reason: ended.failure });
+        if (ended?.compaction) {
+          // Without token counts the provider may have declined; its reply says why.
+          const sent = (after.thread.messages ?? []).findIndex((message) => message.id === messageId);
+          const reply = sent < 0 ? undefined : after.thread.messages
+            .slice(sent + 1)
+            .find((message) => message.role === "assistant" && String(message.text ?? "").trim() !== "");
+          return outcome("compacted", {
+            ...fields,
+            compaction: ended.compaction,
+            reason: ended.compaction.afterTokens === null && reply ? `Provider reply: ${reply.text}` : undefined,
+          });
+        }
+        if (waited.status !== "ready") return outcome("timeout", { ...fields, reason: "Call t3_wait on the thread." });
+        return outcome("failed", {
+          ...fields,
+          reason: after.thread.session?.lastError ?? `The turn ended (${waited.ready[0]?.reason}) without a compaction.`,
+        });
       } catch (error) {
         return errorResult(error);
       }

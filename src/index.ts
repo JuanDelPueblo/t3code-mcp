@@ -19,7 +19,7 @@ function createMcpServer(): McpServer {
   const server = new McpServer(
     {
       name: "t3code-mcp",
-      version: "0.7.2",
+      version: "0.8.0",
       description: "MCP server for orchestrating T3 Code",
     },
     {
@@ -49,6 +49,10 @@ function createMcpServer(): McpServer {
         "5. Call t3_send_message to start another turn on a settled thread; it",
         "   never creates a project, thread, branch, or worktree. Use it to wake",
         "   a worker thread or to send review findings back to the agent.",
+        "   t3_get_thread, t3_wait, and turn results give each thread's context",
+        "   usage (context.usedPercent). Before a follow-up to a long-running",
+        "   worker, call t3_compact_thread with minUsedPercent to compact it",
+        "   only when its context is nearly full.",
         "6. Call t3_get_usage_limits before assigning work. Its structuredContent",
         "   gives used and remaining percent per quota window and per model pool.",
         "   OpenCode Go usage comes from T3 Code, without a separate MCP API key.",

@@ -44,6 +44,7 @@ const calls: Array<[string, Record<string, unknown>]> = [
   ["t3_rename_thread", { threadId: "thread-1", title: "Renamed" }],
   ["t3_send_prompt", { projectId: "project-1", prompt: "work", instanceId: "opencode", model: "opencode-go/model", waitMs: 50 }],
   ["t3_send_message", { threadId: "thread-1", prompt: "continue", waitMs: 50 }],
+  ["t3_compact_thread", { threadId: "thread-1" }],
   ["t3_get_status", { threadId: "thread-1", waitMs: 50 }],
   ["t3_interrupt", { threadId: "thread-1", turnId: "turn-1" }],
   ["t3_stop_session", { threadId: "thread-1" }],
