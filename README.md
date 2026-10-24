@@ -1,5 +1,7 @@
 # t3code-mcp
 
+## Note: Archived as T3 Code v0.1.0 now has a built-in MCP server.
+
 MCP server for orchestrating [T3 Code](https://github.com/pingdotgg/t3code).
 
 This fork targets the current T3 Code authentication and orchestration protocol used by
